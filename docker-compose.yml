@@ -1,0 +1,44 @@
+# DomainSentry — Quick Start (single container)
+# All services on port 8000. Just: docker compose up -d
+#
+# For production with separate containers:
+#   docker compose -f docker-compose.prod.yml up -d
+
+services:
+  domainsentry:
+    build: .
+    container_name: domainsentry
+    restart: unless-stopped
+    environment:
+      - SERVICE_NAME=unified
+      - SERVICE_PORT=8000
+      - VT_API_KEY=${VT_API_KEY:-}
+      - OTX_API_KEY=${OTX_API_KEY:-}
+      - ST_API_KEY=${ST_API_KEY:-}
+      - FEED_DATA=/data/feed
+      - EVENTS_DIR=/data/events
+      - BASELINE_DIR=/data/baselines
+      # Orchestrator URLs — all local in unified mode
+      - FEED_URL=http://localhost:8000
+      - DNS_URL=http://localhost:8000
+      - CERT_URL=http://localhost:8000
+      - HTTP_URL=http://localhost:8000
+      - WHOIS_URL=http://localhost:8000
+      - REP_URL=http://localhost:8000
+      - TWIST_URL=http://localhost:8000
+      - CLASSIFY_URL=http://localhost:8000
+      - EVENT_URL=http://localhost:8000
+    ports:
+      - "${PORT:-8000}:8000"
+    volumes:
+      - domainsentry-data:/data
+      - ./config/whitelists:/data/feed/whitelists:ro
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  domainsentry-data:

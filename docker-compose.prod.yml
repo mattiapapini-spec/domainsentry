@@ -1,0 +1,163 @@
+version: "3.8"
+
+x-common: &common
+  build: .
+  restart: unless-stopped
+  networks:
+    - domain-intel
+
+services:
+
+  # ═══════════════════════════════════════════
+  # FEED MANAGER — gestione domini e whitelist
+  # ═══════════════════════════════════════════
+  feed-manager:
+    <<: *common
+    container_name: di-feed-manager
+    environment:
+      SERVICE_NAME: feed-manager
+      SERVICE_PORT: "8000"
+      FEED_DATA: /data/feed
+    ports:
+      - "8000:8000"
+    volumes:
+      - feed-data:/data/feed
+      - ./config/whitelists:/data/feed/whitelists:ro
+
+  # ═══════════════════════════════════════════
+  # INTELLIGENCE SERVICES
+  # ═══════════════════════════════════════════
+  dns-intel:
+    <<: *common
+    container_name: di-dns-intel
+    environment:
+      SERVICE_NAME: dns-intel
+      SERVICE_PORT: "8001"
+      DNS_TIMEOUT: "10"
+    ports:
+      - "8001:8001"
+
+  cert-intel:
+    <<: *common
+    container_name: di-cert-intel
+    environment:
+      SERVICE_NAME: cert-intel
+      SERVICE_PORT: "8002"
+      CRTSH_TIMEOUT: "30"
+    ports:
+      - "8002:8002"
+
+  http-fingerprint:
+    <<: *common
+    container_name: di-http-fingerprint
+    environment:
+      SERVICE_NAME: http-fingerprint
+      SERVICE_PORT: "8003"
+      HTTP_TIMEOUT: "15"
+    ports:
+      - "8003:8003"
+
+  whois-intel:
+    <<: *common
+    container_name: di-whois-intel
+    environment:
+      SERVICE_NAME: whois-intel
+      SERVICE_PORT: "8004"
+      WHOIS_TIMEOUT: "10"
+      WHOIS_DELAY: "2"
+      CACHE_TTL: "86400"
+    ports:
+      - "8004:8004"
+
+  reputation:
+    <<: *common
+    container_name: di-reputation
+    environment:
+      SERVICE_NAME: reputation
+      SERVICE_PORT: "8005"
+      VT_API_KEY: ${VT_API_KEY:-}
+      OTX_API_KEY: ${OTX_API_KEY:-}
+      ST_API_KEY: ${ST_API_KEY:-}
+    ports:
+      - "8005:8005"
+
+  dnstwist-engine:
+    <<: *common
+    container_name: di-dnstwist
+    environment:
+      SERVICE_NAME: dnstwist-engine
+      SERVICE_PORT: "8006"
+    ports:
+      - "8006:8006"
+
+  # ═══════════════════════════════════════════
+  # CLASSIFIER — diffing + auto-classificazione
+  # ═══════════════════════════════════════════
+  classifier:
+    <<: *common
+    container_name: di-classifier
+    environment:
+      SERVICE_NAME: classifier
+      SERVICE_PORT: "8007"
+      BASELINE_DIR: /data/baselines
+    ports:
+      - "8007:8007"
+    volumes:
+      - baseline-data:/data/baselines
+
+  # ═══════════════════════════════════════════
+  # ORCHESTRATOR — pipeline coordinator
+  # ═══════════════════════════════════════════
+  orchestrator:
+    <<: *common
+    container_name: di-orchestrator
+    environment:
+      SERVICE_NAME: orchestrator
+      SERVICE_PORT: "8010"
+      FEED_URL: http://feed-manager:8000
+      DNS_URL: http://dns-intel:8001
+      CERT_URL: http://cert-intel:8002
+      HTTP_URL: http://http-fingerprint:8003
+      WHOIS_URL: http://whois-intel:8004
+      REP_URL: http://reputation:8005
+      TWIST_URL: http://dnstwist-engine:8006
+      CLASSIFY_URL: http://classifier:8007
+      EVENT_URL: http://event-publisher:8011
+    ports:
+      - "8010:8010"
+    depends_on:
+      - feed-manager
+      - dns-intel
+      - cert-intel
+      - http-fingerprint
+      - whois-intel
+      - reputation
+      - classifier
+      - event-publisher
+
+  # ═══════════════════════════════════════════
+  # EVENT PUBLISHER — routing eventi
+  # ═══════════════════════════════════════════
+  event-publisher:
+    <<: *common
+    container_name: di-events
+    environment:
+      SERVICE_NAME: event-publisher
+      SERVICE_PORT: "8011"
+      EVENTS_DIR: /data/events
+      TARGET_FILE_ENABLED: "true"
+      TARGET_WEBHOOK_ENABLED: "false"
+      WEBHOOK_URL: ${WEBHOOK_URL:-}
+    ports:
+      - "8011:8011"
+    volumes:
+      - event-data:/data/events
+
+networks:
+  domain-intel:
+    driver: bridge
+
+volumes:
+  feed-data:
+  baseline-data:
+  event-data:
