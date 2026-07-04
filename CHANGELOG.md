@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [4.14.0] - 2026-07-04
+
+### Changed
+- **Multi-select case-queue filters.** Status, severity and client filters are now
+  checkbox dropdowns: select any combination (e.g. "New + In progress", two severities,
+  a subset of clients). The client filter is populated dynamically from the case set
+  (no more free-text field). Selections combine as AND across the three filters; an
+  empty selection means "all". Quick views (New / In progress / Critical) drive the
+  same dropdowns. Filtering happens client-side on a single fetch, so combinations
+  don't multiply API calls; works together with the group-by-client view.
+
+## [4.13.1] - 2026-07-04
+
+### Fixed
+- **Whitelist write failed with a 500 when the whitelist directory was mounted
+  read-only.** Both `docker-compose.yml` and `docker-compose.prod.yml` mounted
+  `./config/whitelists:/data/feed/whitelists:ro` — the `:ro` made the directory
+  read-only, so "Whitelist + close FP" from the dashboard (and any POST to
+  `/feed/whitelist`) crashed when trying to write the client's whitelist file.
+  Removed `:ro` from both compose files so runtime whitelist additions persist.
+- **Graceful error on unwritable whitelist storage.** `/feed/whitelist` now catches
+  the write `OSError` and returns a clear **503** ("whitelist storage is not writable
+  …") instead of a raw 500, so an operator who intentionally mounts it read-only gets
+  an actionable message. Regression test added.
+
 ## [4.13.0] - 2026-06-20
 
 ### Added

@@ -47,7 +47,7 @@ services:
       - "${PORT:-8000}:8000"
     volumes:
       - domainsentry-data:/data
-      - ./config/whitelists:/data/feed/whitelists:ro
+      - ./config/whitelists:/data/feed/whitelists
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
       interval: 30s

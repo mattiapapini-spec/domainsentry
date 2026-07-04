@@ -237,6 +237,17 @@
   }
   .filters select:focus, .filters input:focus { outline: none; border-color: var(--cyan); box-shadow: var(--glow-cyan); }
   .filters input { min-width: 200px; }
+  .msel { position: relative; display: inline-block; }
+  .msel-btn { background: var(--panel-2); color: var(--text-dim); border: 1px solid var(--line); border-radius: 6px; padding: 8px 30px 8px 12px; font-size: 13px; font-family: inherit; cursor: pointer; min-width: 150px; text-align: left; position: relative; }
+  .msel-btn::after { content: "▾"; position: absolute; right: 10px; color: var(--text-faint); font-size: 10px; }
+  .msel-btn:hover { border-color: var(--cyan); color: var(--text); }
+  .msel-btn.msel-active { border-color: var(--cyan); color: var(--cyan); }
+  .msel-panel { display: none; position: absolute; top: calc(100% + 4px); left: 0; z-index: 40; min-width: 210px; max-height: 260px; overflow-y: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px; box-shadow: 0 8px 24px rgba(0,0,0,.45); }
+  .msel-panel.open { display: block; }
+  .msel-opt { display: flex; align-items: center; gap: 9px; padding: 7px 9px; font-size: 13px; color: var(--text-dim); border-radius: 5px; cursor: pointer; user-select: none; }
+  .msel-opt:hover { background: rgba(0,233,255,.06); color: var(--text); }
+  .msel-opt input { accent-color: var(--cyan); width: 15px; height: 15px; flex: none; }
+  .msel-empty { padding: 8px 10px; font-size: 12px; color: var(--text-faint); font-style: italic; }
   .group-toggle { display: inline-flex; align-items: center; gap: 7px; padding: 8px 11px; font-size: 13px; color: var(--text-dim); cursor: pointer; user-select: none; }
   .group-toggle input { accent-color: var(--cyan); width: 15px; height: 15px; }
   .group-toggle:hover { color: var(--cyan); }
@@ -542,23 +553,32 @@
     </div>
 
     <div class="filters">
-      <select id="f-status" onchange="loadCases()">
-        <option value="">All statuses</option>
-        <option value="new">New</option>
-        <option value="in_progress">In progress</option>
-        <option value="closed_tp">Closed — True Positive</option>
-        <option value="closed_fp">Closed — False Positive</option>
-        <option value="closed_benign">Closed — Benign</option>
-      </select>
-      <select id="f-sev" onchange="loadCases()">
-        <option value="">All severities</option>
-        <option value="CRITICAL">Critical</option>
-        <option value="HIGH">High</option>
-        <option value="MEDIUM">Medium</option>
-        <option value="LOW">Low</option>
-      </select>
-      <input id="f-client" type="text" placeholder="filter by client…" oninput="debouncedCases()">
-      <label class="group-toggle"><input type="checkbox" id="f-group" onchange="loadCases()"> Group by client</label>
+      <div class="msel" id="ms-status">
+        <button class="msel-btn" id="ms-status-btn" onclick="msToggle(event,'status')">All statuses</button>
+        <div class="msel-panel" id="ms-status-panel">
+          <label class="msel-opt"><input type="checkbox" value="new" onchange="msChange('status')"> New</label>
+          <label class="msel-opt"><input type="checkbox" value="in_progress" onchange="msChange('status')"> In progress</label>
+          <label class="msel-opt"><input type="checkbox" value="closed_tp" onchange="msChange('status')"> Closed — True Positive</label>
+          <label class="msel-opt"><input type="checkbox" value="closed_fp" onchange="msChange('status')"> Closed — False Positive</label>
+          <label class="msel-opt"><input type="checkbox" value="closed_benign" onchange="msChange('status')"> Closed — Benign</label>
+        </div>
+      </div>
+      <div class="msel" id="ms-sev">
+        <button class="msel-btn" id="ms-sev-btn" onclick="msToggle(event,'sev')">All severities</button>
+        <div class="msel-panel" id="ms-sev-panel">
+          <label class="msel-opt"><input type="checkbox" value="CRITICAL" onchange="msChange('sev')"> Critical</label>
+          <label class="msel-opt"><input type="checkbox" value="HIGH" onchange="msChange('sev')"> High</label>
+          <label class="msel-opt"><input type="checkbox" value="MEDIUM" onchange="msChange('sev')"> Medium</label>
+          <label class="msel-opt"><input type="checkbox" value="LOW" onchange="msChange('sev')"> Low</label>
+        </div>
+      </div>
+      <div class="msel" id="ms-client">
+        <button class="msel-btn" id="ms-client-btn" onclick="msToggle(event,'client')">All clients</button>
+        <div class="msel-panel" id="ms-client-panel">
+          <div class="msel-empty">no clients yet</div>
+        </div>
+      </div>
+      <label class="group-toggle"><input type="checkbox" id="f-group" onchange="applyFilters()"> Group by client</label>
     </div>
 
     <div class="table-wrap">
@@ -885,11 +905,10 @@ function setView(v) {
   $("view-title").textContent = VIEW_TITLES[v] || "Case Queue";
 
   // Map view → filters
-  const fs = $("f-status"), fv = $("f-sev");
-  fs.value = ""; fv.value = ""; viewAssignee = null;
-  if (v === "new") fs.value = "new";
-  else if (v === "progress") fs.value = "in_progress";
-  else if (v === "critical") fv.value = "CRITICAL";
+  msReset(); viewAssignee = null;
+  if (v === "new") msSelectOnly("status", "new");
+  else if (v === "progress") msSelectOnly("status", "in_progress");
+  else if (v === "critical") msSelectOnly("sev", "CRITICAL");
   else if (v === "mine") viewAssignee = ME ? ME.id : null;
   loadCases();
 }
@@ -1185,25 +1204,90 @@ async function loadSummary() {
   } catch (e) { toast(e.message, "bad"); }
 }
 
-let debTimer = null;
-function debouncedCases() { clearTimeout(debTimer); debTimer = setTimeout(loadCases, 300); }
+// (client filter is now a checkbox multi-select — no debounced text input needed)
+
+// ── Multi-select filters ──
+// Empty set = "all". Selections combine: (status ∈ S) AND (severity ∈ V) AND (client ∈ C).
+const MSEL = { status: new Set(), sev: new Set(), client: new Set() };
+const MSEL_ALL = { status: "All statuses", sev: "All severities", client: "All clients" };
+let ALL_CASES = [];
+
+function msToggle(ev, k) {
+  ev.stopPropagation();
+  const p = $(`ms-${k}-panel`);
+  const open = p.classList.contains("open");
+  document.querySelectorAll(".msel-panel.open").forEach(x => x.classList.remove("open"));
+  if (!open) p.classList.add("open");
+}
+document.addEventListener("click", (e) => {
+  if (!e.target.closest(".msel"))
+    document.querySelectorAll(".msel-panel.open").forEach(x => x.classList.remove("open"));
+});
+
+function msChange(k) {
+  const boxes = document.querySelectorAll(`#ms-${k}-panel input[type=checkbox]`);
+  MSEL[k].clear();
+  boxes.forEach(b => { if (b.checked) MSEL[k].add(b.value); });
+  msLabel(k);
+  applyFilters();
+}
+
+function msLabel(k) {
+  const btn = $(`ms-${k}-btn`);
+  const vals = [...MSEL[k]];
+  if (vals.length === 0) { btn.textContent = MSEL_ALL[k]; btn.classList.remove("msel-active"); return; }
+  btn.classList.add("msel-active");
+  const pretty = vals.map(v => v.replace("closed_", "").replace("_", " "));
+  btn.textContent = pretty.length <= 2 ? pretty.join(", ") : `${pretty[0]} +${pretty.length - 1}`;
+}
+
+function msReset() {
+  for (const k of ["status", "sev", "client"]) {
+    MSEL[k].clear();
+    document.querySelectorAll(`#ms-${k}-panel input[type=checkbox]`).forEach(b => b.checked = false);
+    msLabel(k);
+  }
+}
+
+function msSelectOnly(k, value) {
+  MSEL[k] = new Set([value]);
+  document.querySelectorAll(`#ms-${k}-panel input[type=checkbox]`).forEach(b => b.checked = (b.value === value));
+  msLabel(k);
+}
+
+function populateClientOptions(cases) {
+  const names = [...new Set(cases.map(c => c.client))].sort((a, b) => a.localeCompare(b));
+  const panel = $("ms-client-panel");
+  if (names.length === 0) { panel.innerHTML = '<div class="msel-empty">no clients yet</div>'; return; }
+  panel.innerHTML = names.map(n =>
+    `<label class="msel-opt"><input type="checkbox" value="${esc(n)}" ${MSEL.client.has(n) ? "checked" : ""} onchange="msChange('client')"> ${esc(n)}</label>`
+  ).join("");
+  // drop selections for clients that no longer exist
+  [...MSEL.client].forEach(n => { if (!names.includes(n)) MSEL.client.delete(n); });
+  msLabel("client");
+}
 
 async function loadCases() {
   const params = new URLSearchParams();
-  const st = $("f-status").value, sv = $("f-sev").value, cl = $("f-client").value.trim();
-  const grouped = $("f-group") && $("f-group").checked;
-  if (st) params.set("status", st);
-  if (sv) params.set("severity", sv);
-  if (cl) params.set("client", cl);
   if (viewAssignee != null) params.set("assignee", viewAssignee);
-  // When grouping, pull the full set so every client's cases are present
-  params.set("limit", grouped ? "1000" : "200");
+  // single full fetch; status/severity/client combine client-side (multi-select)
+  params.set("limit", "1000");
   try {
     const r = await api("/cases?" + params.toString());
-    if (grouped) renderGrouped(r.cases);
-    else renderRows(r.cases);
+    ALL_CASES = r.cases;
+    populateClientOptions(ALL_CASES);
+    applyFilters();
     if (VIEW === "mine") $("c-mine").textContent = r.count;
   } catch (e) { toast(e.message, "bad"); }
+}
+
+function applyFilters() {
+  let cs = ALL_CASES;
+  if (MSEL.status.size) cs = cs.filter(c => MSEL.status.has(c.status));
+  if (MSEL.sev.size) cs = cs.filter(c => MSEL.sev.has(c.severity));
+  if (MSEL.client.size) cs = cs.filter(c => MSEL.client.has(c.client));
+  const grouped = $("f-group") && $("f-group").checked;
+  if (grouped) renderGrouped(cs); else renderRows(cs);
 }
 
 function fmtDate(s) {

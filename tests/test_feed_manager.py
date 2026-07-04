@@ -322,3 +322,24 @@ class TestPromoteDomain:
         c = self._client(monkeypatch, tmp_path)
         r = c.post("/feed/domains/promote", json={"domain": "not a domain", "client": "kedrion"})
         assert r.status_code == 422
+
+
+class TestWhitelistReadOnlyStorage:
+    """Regression: a read-only whitelist mount made the endpoint 500 with a raw
+    OSError. It must return a clear 503 instead (storage not writable)."""
+    def test_readonly_returns_503_not_500(self, monkeypatch, tmp_path):
+        import importlib
+        monkeypatch.setenv("FEED_FILE", str(tmp_path / "feed.json"))
+        monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+        monkeypatch.setenv("FEED_REQUIRE_AUTH", "false")
+        import services.feed_manager as fm
+        importlib.reload(fm)
+        # force the save to raise OSError (simulates read-only FS)
+        def boom(*a, **k):
+            raise OSError(30, "Read-only file system")
+        monkeypatch.setattr(fm, "_save_whitelist", boom)
+        c = TestClient(fm.app)
+        r = c.post("/feed/whitelist?client=acme",
+                   json={"domain": "x.com", "reason": "test", "added_by": "admin"})
+        assert r.status_code == 503
+        assert "writable" in r.json()["detail"].lower()

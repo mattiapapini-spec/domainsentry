@@ -25,7 +25,7 @@ services:
       - "8000:8000"
     volumes:
       - feed-data:/data/feed
-      - ./config/whitelists:/data/feed/whitelists:ro
+      - ./config/whitelists:/data/feed/whitelists
 
   # ═══════════════════════════════════════════
   # INTELLIGENCE SERVICES

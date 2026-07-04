@@ -269,7 +269,18 @@ def add_whitelist(client: str = Query(...), entry: WhitelistAdd = ..., _user=Dep
     wl.setdefault("domains", {})[entry.domain] = {
         "reason": entry.reason, "added_by": entry.added_by, "added": now_iso()
     }
-    _save_whitelist(client, wl)
+    try:
+        _save_whitelist(client, wl)
+    except OSError as e:
+        # e.g. the whitelist dir is mounted read-only. Return a clear, actionable
+        # error instead of a raw 500 so the operator knows it's a storage/mount
+        # problem, not a bug in the request.
+        logger.error(f"whitelist write failed for {sanitize_log_input(client)}: {e}")
+        raise HTTPException(
+            503,
+            "Whitelist storage is not writable (check that /data/feed/whitelists "
+            "is a writable volume, not mounted read-only)."
+        )
     return {"status": "whitelisted", "domain": entry.domain}
 
 
