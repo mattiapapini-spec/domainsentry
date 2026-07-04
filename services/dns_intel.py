@@ -63,16 +63,21 @@ def dns_check(
         "records": dmarc_valid
     }
 
-    # DKIM
+    # DKIM (parallelo — 18 selettori concorrenti)
+    from concurrent.futures import ThreadPoolExecutor
     selectors = dkim_selectors.split(",") if dkim_selectors else DEFAULT_DKIM_SELECTORS
+    selectors = [s.strip() for s in selectors if s.strip()]
     dkim_found = {}
-    for sel in selectors:
-        sel = sel.strip()
-        if not sel:
-            continue
+
+    def _check_selector(sel):
         dk = dig_query(f"{sel}._domainkey.{domain}", "TXT", DNS_TIMEOUT)
-        if is_valid(dk):
-            dkim_found[sel] = dk
+        return (sel, dk) if is_valid(dk) else (sel, None)
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for sel, dk in ex.map(_check_selector, selectors):
+            if dk:
+                dkim_found[sel] = dk
+
     result["email_auth"]["dkim"] = {
         "selectors_found": list(dkim_found.keys()),
         "selectors_tested": len(selectors),
@@ -93,10 +98,9 @@ def dns_check(
         "records": caa if is_valid(caa) else []
     }
 
-    # Sottodomini
+    # Sottodomini (parallelo — 25 sottodomini concorrenti)
     if subdomains:
-        active = []
-        for sub in DEFAULT_SUBDOMAINS:
+        def _check_sub(sub):
             fqdn = f"{sub}.{domain}"
             a = dig_query(fqdn, "A", DNS_TIMEOUT)
             c = dig_query(fqdn, "CNAME", DNS_TIMEOUT)
@@ -105,8 +109,13 @@ def dns_check(
                 "A": a if is_valid(a) else [],
                 "CNAME": c if is_valid(c) else []
             }
-            if sub_result["A"] or sub_result["CNAME"]:
-                active.append(sub_result)
+            return sub_result if (sub_result["A"] or sub_result["CNAME"]) else None
+
+        active = []
+        with ThreadPoolExecutor(max_workers=10) as ex:
+            for res in ex.map(_check_sub, DEFAULT_SUBDOMAINS):
+                if res:
+                    active.append(res)
         result["subdomains"] = {
             "tested": len(DEFAULT_SUBDOMAINS),
             "active": active

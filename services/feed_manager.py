@@ -3,16 +3,18 @@ Feed Manager Service (:8000)
 Gestione liste domini e whitelist.
 """
 
+from typing import Optional, List
 import os, json, logging
 from pathlib import Path
-from fastapi import FastAPI, APIRouter, Query, HTTPException
+from fastapi import FastAPI, APIRouter, Query, HTTPException, Header, Depends
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, field_validator
+from shared.compat import BaseModel, field_validator
 
 from shared.security import apply_security, sanitize_error, sanitize_log_input
+from shared.auth import verify_token_remote
 from shared.utils import now_iso
 
-app = FastAPI(title="Feed Manager", version="4.0.0")
+app = FastAPI(title="Feed Manager", version="4.1.0")
 apply_security(app)
 router = APIRouter()
 logger = logging.getLogger("feed")
@@ -21,6 +23,35 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [FEED] %(message)s")
 DATA_DIR = Path(os.environ.get("FEED_DATA", "/data/feed"))
 FEED_FILE = DATA_DIR / "feed.json"
 WHITELIST_DIR = DATA_DIR / "whitelists"
+
+# ── Optional auth on write endpoints ──
+# When FEED_REQUIRE_AUTH=true, POST/DELETE endpoints require a valid bearer
+# token validated against the case-manager. Reads stay open. When false
+# (default), the service behaves as before — preserving standalone use.
+FEED_REQUIRE_AUTH = os.environ.get("FEED_REQUIRE_AUTH", "false").lower() == "true"
+CASE_MANAGER_URL = os.environ.get("CASE_MANAGER_URL", "http://case-manager:8012")
+
+
+def require_feed_auth(permission: str):
+    """Dependency factory: require a valid token with `permission` on writes.
+
+    No-op when FEED_REQUIRE_AUTH is false. When true, validates the bearer
+    token against the case-manager and checks the permission. Fails closed:
+    if the auth service is unreachable, the write is denied.
+    """
+    def checker(authorization: str = Header(None)):
+        if not FEED_REQUIRE_AUTH:
+            return None
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(401, "Authentication required for write operations")
+        token = authorization[7:]
+        user = verify_token_remote(token, CASE_MANAGER_URL)
+        if user is None:
+            raise HTTPException(401, "Invalid token or authentication service unreachable")
+        if permission not in user.get("permissions", []):
+            raise HTTPException(403, f"Permission required: {permission}")
+        return user
+    return checker
 
 
 def _ensure_dirs():
@@ -145,7 +176,7 @@ class DomainAdd(BaseModel):
 
 
 @router.post("/feed/domains", tags=["Feed"])
-def add_domain(entry: DomainAdd):
+def add_domain(entry: DomainAdd, _user=Depends(require_feed_auth("manage_cases"))):
     feed = _load_feed()
     # Check duplicati
     if any(d["domain"] == entry.domain and d["client"] == entry.client
@@ -161,7 +192,7 @@ def add_domain(entry: DomainAdd):
 
 
 @router.delete("/feed/domains/{domain}")
-def remove_domain(domain: str, client: str = Query(None)):
+def remove_domain(domain: str, client: str = Query(None), _user=Depends(require_feed_auth("manage_cases"))):
     feed = _load_feed()
     before = len(feed["domains"])
     feed["domains"] = [d for d in feed["domains"]
@@ -170,6 +201,51 @@ def remove_domain(domain: str, client: str = Query(None)):
         raise HTTPException(404, f"{domain} non trovato")
     _save_feed(feed)
     return {"status": "removed", "domain": domain}
+
+
+class DomainPromote(BaseModel):
+    domain: str
+    client: str
+    type: str = "target"
+
+    @field_validator("domain")
+    @classmethod
+    def _v_domain(cls, v):
+        import re
+        v = v.strip().lower()
+        if not re.match(r'^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}$', v):
+            raise ValueError(f"Invalid domain format: {v}")
+        return v
+
+
+@router.post("/feed/domains/promote", tags=["Feed"])
+def promote_domain(req: DomainPromote, _user=Depends(require_feed_auth("manage_cases"))):
+    """
+    Add a domain as a monitored target for an EXISTING client, resolving the
+    client's legitimate domain from the feed automatically. Used to promote a
+    dnstwist-discovered variant into active monitoring after triage, or to add
+    a domain to a client by hand without re-onboarding.
+    """
+    feed = _load_feed()
+    # Resolve the client's legitimate domain from its existing entries
+    legit = None
+    for d in feed["domains"]:
+        if d.get("client") == req.client and d.get("legitimate"):
+            legit = d["legitimate"]
+            break
+    if not legit:
+        raise HTTPException(404, f"Client '{req.client}' not found (no existing domains to derive the legitimate domain from)")
+
+    if any(d["domain"] == req.domain and d["client"] == req.client for d in feed["domains"]):
+        raise HTTPException(400, f"{req.domain} already monitored for {req.client}")
+
+    feed["domains"].append({
+        "domain": req.domain, "client": req.client, "legitimate": legit,
+        "type": "watchlist" if req.type == "watchlist" else "target",
+        "added": now_iso(), "source": "promote",
+    })
+    _save_feed(feed)
+    return {"status": "added", "domain": req.domain, "client": req.client, "legitimate": legit}
 
 
 # ── Whitelist ──
@@ -188,7 +264,7 @@ class WhitelistAdd(BaseModel):
 
 
 @router.post("/feed/whitelist", tags=["Whitelist"])
-def add_whitelist(client: str = Query(...), entry: WhitelistAdd = ...):
+def add_whitelist(client: str = Query(...), entry: WhitelistAdd = ..., _user=Depends(require_feed_auth("whitelist"))):
     wl = _load_whitelist(client)
     wl.setdefault("domains", {})[entry.domain] = {
         "reason": entry.reason, "added_by": entry.added_by, "added": now_iso()
@@ -198,7 +274,7 @@ def add_whitelist(client: str = Query(...), entry: WhitelistAdd = ...):
 
 
 @router.delete("/feed/whitelist/{domain}")
-def remove_whitelist(domain: str, client: str = Query(...)):
+def remove_whitelist(domain: str, client: str = Query(...), _user=Depends(require_feed_auth("whitelist"))):
     wl = _load_whitelist(client)
     if domain not in wl.get("domains", {}):
         raise HTTPException(404, f"{domain} non in whitelist")
@@ -212,15 +288,91 @@ def remove_whitelist(domain: str, client: str = Query(...)):
 @router.get("/feed/clients", tags=["Feed"])
 def list_clients():
     feed = _load_feed()
+    notes = feed.get("client_notes", {})
     clients = {}
     for d in feed.get("domains", []):
         c = d.get("client", "unknown")
         if c not in clients:
-            clients[c] = {"name": c, "targets": [], "watchlist": [], "legitimate": d.get("legitimate")}
+            clients[c] = {"name": c, "targets": [], "watchlist": [],
+                          "legitimate": d.get("legitimate"), "notes": notes.get(c, "")}
         if d.get("type") == "target":
             clients[c]["targets"].append(d["domain"])
         else:
             clients[c]["watchlist"].append(d["domain"])
     return {"clients": list(clients.values()), "total": len(clients)}
+
+
+class OnboardDomain(BaseModel):
+    domain: str
+    type: str = "target"  # target | watchlist
+
+
+class ClientOnboard(BaseModel):
+    client: str
+    legitimate: str
+    domains: list[OnboardDomain] = []
+    notes: str = ""
+
+    @field_validator("client")
+    @classmethod
+    def _validate_client(cls, v):
+        import re
+        v = v.strip()
+        if not re.match(r'^[a-zA-Z0-9_-]+$', v):
+            raise ValueError("Client name: only alphanumeric, hyphens and underscores")
+        return v
+
+    @field_validator("legitimate")
+    @classmethod
+    def _validate_legit(cls, v):
+        import re
+        v = v.strip().lower()
+        if not re.match(r'^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}$', v):
+            raise ValueError(f"Invalid legitimate domain: {v}")
+        return v
+
+    @field_validator("notes")
+    @classmethod
+    def _cap_notes(cls, v):
+        return (v or "")[:2000]
+
+
+@router.post("/feed/clients/onboard", tags=["Feed"])
+def onboard_client(req: ClientOnboard, _user=Depends(require_feed_auth("manage_cases"))):
+    """
+    Onboard a client in one shot: register its monitored domains (target/watchlist)
+    against the legitimate domain, plus an optional client note. Validates every
+    domain up front and reports which were added vs. skipped (duplicates/invalid).
+    """
+    import re
+    dom_re = re.compile(r'^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}$')
+    feed = _load_feed()
+    existing = {(d["domain"], d["client"]) for d in feed["domains"]}
+
+    added, skipped = [], []
+    for item in req.domains:
+        dom = (item.domain or "").strip().lower()
+        if not dom or not dom_re.match(dom):
+            skipped.append({"domain": item.domain, "reason": "invalid format"})
+            continue
+        if (dom, req.client) in existing:
+            skipped.append({"domain": dom, "reason": "already present"})
+            continue
+        feed["domains"].append({
+            "domain": dom, "client": req.client, "legitimate": req.legitimate,
+            "type": "watchlist" if item.type == "watchlist" else "target",
+            "added": now_iso(), "source": "onboard",
+        })
+        existing.add((dom, req.client))
+        added.append(dom)
+
+    if req.notes:
+        feed.setdefault("client_notes", {})[req.client] = req.notes
+
+    _save_feed(feed)
+    return {"status": "onboarded", "client": req.client,
+            "added": added, "added_count": len(added),
+            "skipped": skipped, "skipped_count": len(skipped)}
+
 
 app.include_router(router)

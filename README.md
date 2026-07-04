@@ -15,7 +15,7 @@ Built for SOC teams and MSSPs. 10 modular services, deployable as a single conta
 ## Quick Start
 
 ```bash
-git clone https://github.com/mattiapapini-spec/domainsentry.git
+git clone https://github.com/YOUR_USERNAME/domainsentry.git
 cd domainsentry
 cp .env.example .env
 docker compose up -d --build
@@ -31,19 +31,24 @@ curl "http://localhost:8000/dns?domain=example.com&full=true"
 
 ## Features
 
+### Intelligence engine
 - **Domain permutation discovery** — dnstwist with bitsquatting, homoglyph, transposition, omission, vowel-swap
 - **DNS intelligence** — A/AAAA/MX/NS/TXT/SOA/CNAME + DMARC, DKIM (17 selectors), BIMI, CAA, 25 subdomains
 - **Certificate Transparency** — crt.sh + SAN auto-discovery + TLS live inspection
-- **HTTP fingerprinting** — Content hashing, phishing form detection, brand keyword matching
-- **Hidden element detection** — Invisible iframes, hidden forms, obfuscated JS, meta redirects, tracking pixels, base64 payloads, staged code in HTML comments (10 categories, risk score 0-100)
-- **WHOIS intelligence** — Structured lookup with registrar, dates, privacy detection, LRU cache
+- **HTTP fingerprinting** — content hashing, credential-form detection, brand keyword matching
+- **Hidden element detection** — invisible iframes, hidden forms, obfuscated JS, meta redirects, tracking pixels, base64 payloads, staged code in HTML comments (context-aware: self-hosted resources and benign framework JS are not counted, so legitimate sites don't false-positive)
+- **WHOIS intelligence** — structured lookup with registrar, dates, privacy detection, LRU cache
 - **Reputation scoring** — VirusTotal + AlienVault OTX + SecurityTrails, aggregated risk 0-100
 - **Auto-classification** — parking, for_sale, legitimate_probable, suspicious, needs_review
-- **Legitimate domain compromise detection** — Hidden elements on your own domain trigger CRITICAL alerts
-- **Baseline diffing** — 40+ alert types (CRITICAL/HIGH/MEDIUM/LOW)
-- **Whitelist** — Exclude verified domains via API or plain text files
-- **NDJSON events** — Structured SOC events for SIEM/SOAR
-- **Webhook** — Slack/Teams notifications
+- **Baseline diffing** — 40+ alert types (CRITICAL/HIGH/MEDIUM/LOW); a domain flagged as the client's own legitimate is not treated as a threat against itself
+
+### Triage & operations
+- **Analyst dashboard** (opt-in) — single-file web UI: case queue with status/severity/client filters and **group-by-client** view, per-domain intelligence tab (DNS/MX/cert/HTTP with expandable hidden-risk detail + baseline-diff timeline), raw JSON, permission-gated actions
+- **Case management** (opt-in) — SQLite-backed triage with token auth, RBAC (admin/analyst/viewer + overrides), assignment, notes, whitelist-and-close, and **reopen**
+- **Client management** — onboard clients (single + bulk domains), promote a triaged variant to a monitored target, add domains to existing clients, per-client view with open-case counts and **downloadable reports (raw JSON + readable HTML)**
+- **Run scan from the UI** — pick client + scope (all/target/watchlist), optional dnstwist discovery and per-variant intelligence collection
+- **Live scan progress** — real pipeline telemetry (phase, current domain, done/total) + streaming log console, via `/progress`
+- **NDJSON events + webhook** — structured SOC events for SIEM/SOAR, Slack/Teams notifications
 
 ## Deployment Modes
 
@@ -73,8 +78,10 @@ docker compose -f docker-compose.prod.yml up -d
 | reputation | 8005 | VT/OTX/ST + risk score |
 | dnstwist-engine | 8006 | Permutation scan |
 | classifier | 8007 | Auto-classification + diffing |
-| orchestrator | 8010 | Pipeline coordination |
+| orchestrator | 8010 | Pipeline coordination + progress telemetry |
 | event-publisher | 8011 | Event routing |
+| case-manager | 8012 | Case triage, auth, RBAC (opt-in) |
+| dashboard | 8013 | Analyst web UI (opt-in) |
 
 ### Local (no Docker)
 
@@ -83,35 +90,90 @@ PYTHONPATH=. python run_service.py unified            # all services
 PYTHONPATH=. python run_service.py dns-intel           # single service
 ```
 
+## Security
+
+> **Read this before exposing DomainSentry on any network.**
+
+DomainSentry has two trust zones, and they are secured differently by design.
+
+### Authenticated zone (dashboard + case management)
+
+The **case-manager** and **dashboard** endpoints (`/auth/*`, `/cases/*`, `/users/*`,
+`/summary`, and the dashboard UI) require authentication: token-based sessions
+(PBKDF2, 600k iterations) with role-based access control (admin / analyst / viewer
+plus per-permission overrides). These are safe to expose behind a reverse proxy.
+
+### Unauthenticated zone (intelligence engine) — network isolation required
+
+The **orchestrator** and the individual intelligence services (`/intel`, `/trigger`,
+`/status`, `/progress`, `/events`, and the per-service endpoints on ports 8001–8011)
+have **no application-level authentication, by design**. They are the internal engine,
+intended to sit on a private network and be reachable only by the orchestrator and the
+case-manager — not by end users.
+
+The chosen mitigation is **network isolation**, not app-level auth:
+
+- **Production (recommended):** deploy with `docker-compose.prod.yml` (separate
+  containers on an internal Docker network) behind a reverse proxy that exposes **only**
+  the dashboard port and the authenticated paths (`/auth`, `/cases`, `/summary`). The
+  orchestrator and intelligence services stay on the internal network, unreachable from
+  outside. Example nginx: proxy `location /` and `location /auth`, `location /cases` to
+  the dashboard/case-manager; do **not** add a proxy pass for the orchestrator.
+- **Unified mode (evaluation only):** everything runs on port 8000, so the orchestrator
+  endpoints ARE reachable by anyone who can reach that port. This is fine on `localhost`
+  or a trusted LAN for evaluation, but for any exposed deployment you must either use the
+  production split above, or put a path-filtering reverse proxy in front that only
+  forwards the authenticated paths.
+
+**Do not** expose unified mode directly to the internet, and do not port-forward the
+orchestrator/intelligence ports. If you need authenticated programmatic access to the
+engine, put it behind the case-manager (which does authenticate) or add your own gateway.
+
+### Operational notes
+
+- dnstwist discovery is a **signal, not a verdict** (~74% of registered permutations are
+  benign third parties or parking). Variants land as `needs_review` cases for manual
+  OSINT before any escalation — the tool never auto-promotes a variant to a monitored
+  threat.
+- API keys (VirusTotal, OTX, SecurityTrails) live in `.env`, which is gitignored. Never
+  commit real keys.
+
 ## Architecture
 
 ```
                     ┌─────────────────────────────────────────┐
                     │         UNIFIED MODE (:8000)            │
-                    │      All services, one container        │
+                    │   All services in one container          │
                     └─────────────────────────────────────────┘
                                      OR
 ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐
 │ DNS :8001│   │CERT :8002│   │HTTP :8003│   │WHOIS:8004│   │ REP :8005│
 └─────┬────┘   └─────┬────┘   └─────┬────┘   └─────┬────┘   └─────┬────┘
-      └───────────────┴───────────────┴───────────────┴───────────────┘
-                                     │
-                              ┌──────┴──────┐
-                              │ Classifier  │
-                              │    :8007    │
-                              └──────┬──────┘
-                                     │
+      └───────────────┴───────┬───────┴───────────────┴───────────────┘
+                       ┌───────┴───────┐   ┌─────────────┐
+                       │ dnstwist :8006│   │ Classifier  │
+                       └───────┬───────┘   │    :8007    │
+                               └─────┬─────┘
+        ── INTERNAL NETWORK ─────────┼──────────────────────────────
     ┌──────────┐              ┌──────┴──────┐              ┌──────────┐
     │  Feed    │──────────────│ Orchestrator│──────────────│  Events  │
     │  :8000   │              │    :8010    │              │  :8011   │
-    └──────────┘              └─────────────┘              └────┬─────┘
-                                                               │
-                                                    ┌──────────┼──────────┐
-                                                    ▼          ▼          ▼
-                                                 [File]   [Webhook]  [SIEM/SOAR]
+    └──────────┘              └──────┬──────┘              └────┬─────┘
+                                     │ intel + cases            │
+        ── AUTHENTICATED EDGE ───────┼──────────────────────────┼─────
+                              ┌──────┴──────┐            ┌───────┴──────┐
+                              │ Case-mgr    │            │ [SIEM/SOAR]  │
+                              │   :8012     │            │  [Webhook]   │
+                              └──────┬──────┘            └──────────────┘
+                              ┌──────┴──────┐
+                              │ Dashboard   │  ◄── users log in here
+                              │   :8013     │
+                              └─────────────┘
 ```
 
-Every service works standalone. In unified mode all endpoints share port 8000.
+The dashed lines mark the trust boundary (see [Security](#security)): the intelligence
+engine and orchestrator sit on the internal network; only the case-manager and dashboard
+are meant to be reachable by users, and both authenticate.
 
 ## Usage
 

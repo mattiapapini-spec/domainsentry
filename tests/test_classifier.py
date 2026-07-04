@@ -143,3 +143,53 @@ class TestHealth:
         resp = client.get("/health")
         assert resp.status_code == 200
         assert resp.json()["status"] == "healthy"
+
+
+# ═══════════════════════════════════════════
+# REGRESSION: /diff crash on None-valued intel keys
+# ═══════════════════════════════════════════
+
+class TestDiffNoneSafety:
+    """
+    A stored snapshot can have a key PRESENT with value None (e.g. "cert": null
+    when a domain has no certificates). baseline_diff must not crash on these.
+    Reproduces the kedrionta.com HTTP 500 found in production.
+    """
+
+    def _mk(self, **over):
+        base = {
+            "dns": {"records": {"A": ["1.2.3.4"]}, "email_auth": {}},
+            "cert": None, "http": None, "whois": None, "reputation": None,
+        }
+        base.update(over)
+        return base
+
+    def test_diff_survives_none_cert(self):
+        from services.classifier import baseline_diff, DiffInput
+        r = baseline_diff(DiffInput(domain="x.com", client="c", legitimate="leg.com",
+                                    baseline=self._mk(), current=self._mk()))
+        assert r.status_code == 200
+
+    def test_diff_survives_all_none_sections(self):
+        from services.classifier import baseline_diff, DiffInput
+        # every optional section None on both sides
+        allnone = {"dns": None, "cert": None, "http": None, "whois": None, "reputation": None}
+        r = baseline_diff(DiffInput(domain="x.com", client="c", legitimate="leg.com",
+                                    baseline=allnone, current=allnone))
+        assert r.status_code == 200
+
+    def test_diff_detects_changes_from_none_baseline(self):
+        """Going from None sections to populated ones should still detect changes."""
+        import json
+        from services.classifier import baseline_diff, DiffInput
+        prev = {"dns": {"records": {"A": []}, "email_auth": {"spf": {"present": False}}},
+                "cert": None, "http": None, "whois": None, "reputation": None}
+        curr = {"dns": {"records": {"A": ["9.9.9.9"], "MX": ["10 m.x"]}, "email_auth": {"spf": {"present": True, "records": ["v=spf1 ~all"]}}},
+                "cert": {"ct_certificates": {"total": 3}}, "http": {"checks": [{"url": "http://x.com", "status_code": 200}]},
+                "whois": None, "reputation": None}
+        r = baseline_diff(DiffInput(domain="x.com", client="c", legitimate="leg.com", baseline=prev, current=curr))
+        assert r.status_code == 200
+        body = json.loads(r.body)
+        types = {a["type"] for a in body["alerts"]}
+        assert "mx_record_changed" in types
+        assert "http_activated" in types

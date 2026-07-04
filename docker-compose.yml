@@ -18,6 +18,21 @@ services:
       - FEED_DATA=/data/feed
       - EVENTS_DIR=/data/events
       - BASELINE_DIR=/data/baselines
+      # Case manager (opt-in): set ENABLE_CASE_MANAGER=true in .env to activate
+      - ENABLE_CASE_MANAGER=${ENABLE_CASE_MANAGER:-false}
+      - CASES_DB=/data/cases/cases.db
+      - TOKEN_TTL_HOURS=12
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
+      # Feed write auth (opt-in): requires case-manager enabled
+      - FEED_REQUIRE_AUTH=${FEED_REQUIRE_AUTH:-false}
+      - CASE_MANAGER_URL=http://localhost:8000
+      # Auto case ingestion: pipeline events become cases (opt-in)
+      - CASE_INGEST=${CASE_INGEST:-false}
+      - SERVICE_TOKEN=${SERVICE_TOKEN:-}
+      - CASE_INGEST_TOKEN=${SERVICE_TOKEN:-}
+      - INTEL_STORE=${INTEL_STORE:-false}
+      - INTEL_DIR=/data/intel
       # Orchestrator URLs — all local in unified mode
       - FEED_URL=http://localhost:8000
       - DNS_URL=http://localhost:8000

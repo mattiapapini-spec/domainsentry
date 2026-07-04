@@ -18,6 +18,9 @@ services:
       SERVICE_NAME: feed-manager
       SERVICE_PORT: "8000"
       FEED_DATA: /data/feed
+      # Feed write auth (opt-in). Requires case-manager enabled and reachable.
+      FEED_REQUIRE_AUTH: ${FEED_REQUIRE_AUTH:-false}
+      CASE_MANAGER_URL: http://case-manager:8012
     ports:
       - "8000:8000"
     volumes:
@@ -153,6 +156,48 @@ services:
     volumes:
       - event-data:/data/events
 
+  # ═══════════════════════════════════════════
+  # CASE MANAGER — SOC case management + auth (opt-in)
+  # Stateful: requires persistent volume for SQLite
+  # ═══════════════════════════════════════════
+  case-manager:
+    <<: *common
+    container_name: di-case-manager
+    environment:
+      SERVICE_NAME: case-manager
+      SERVICE_PORT: "8012"
+      CASES_DB: /data/cases/cases.db
+      TOKEN_TTL_HOURS: "12"
+      FEED_URL: http://feed-manager:8000
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+    ports:
+      - "8012:8012"
+    volumes:
+      - case-data:/data/cases
+    depends_on:
+      - feed-manager
+
+  # ═══════════════════════════════════════════
+  # DASHBOARD — SOC triage UI (opt-in)
+  # Serves the static HTML page. Calls the case-manager API.
+  # NOTE: in this multi-container layout the dashboard (:8013) and the
+  # case-manager (:8012) are different origins, so browser calls are
+  # cross-origin. Put both behind one reverse proxy (same origin) in
+  # production, or enable CORS on the case-manager. In unified mode this
+  # is a non-issue (same port).
+  # ═══════════════════════════════════════════
+  dashboard:
+    <<: *common
+    container_name: di-dashboard
+    environment:
+      SERVICE_NAME: dashboard
+      SERVICE_PORT: "8013"
+    ports:
+      - "8013:8013"
+    depends_on:
+      - case-manager
+
 networks:
   domain-intel:
     driver: bridge
@@ -161,3 +206,4 @@ volumes:
   feed-data:
   baseline-data:
   event-data:
+  case-data:

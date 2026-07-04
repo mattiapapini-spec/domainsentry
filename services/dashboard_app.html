@@ -1,0 +1,1635 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DomainSentry · SOC</title>
+<style>
+  :root {
+    /* ── XSIAM-cyberpunk palette ── */
+    --bg: #05070f;
+    --bg-grid: #0a0e1c;
+    --panel: #0b1020;
+    --panel-2: #0e1426;
+    --panel-3: #121a30;
+    --line: #1a2440;
+    --line-soft: #131c33;
+    --text: #d6e2ff;
+    --text-dim: #6f80a8;
+    --text-faint: #4a5878;
+    --cyan: #00e9ff;
+    --cyan-dim: #00b8cc;
+    --magenta: #ff2d78;
+    --violet: #a06bff;
+    --green: #21e6a4;
+    --amber: #ffb020;
+    --crit: #ff2e63;
+    --high: #ff8c1a;
+    --med: #ffd60a;
+    --low: #00e9ff;
+    --mono: 'SF Mono', 'Cascadia Code', 'JetBrains Mono', Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    --glow-cyan: 0 0 8px rgba(0,233,255,.5);
+    --glow-mag: 0 0 8px rgba(255,45,120,.55);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    font-family: var(--sans); color: var(--text); font-size: 13.5px; line-height: 1.5;
+    background-color: var(--bg);
+    background-image:
+      linear-gradient(rgba(0,233,255,.025) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0,233,255,.025) 1px, transparent 1px);
+    background-size: 44px 44px;
+  }
+  button { font-family: inherit; cursor: pointer; }
+  input, select, textarea { font-family: inherit; font-size: 13.5px; }
+  ::selection { background: rgba(0,233,255,.25); }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb { background: #1c2848; border-radius: 5px; border: 2px solid var(--bg); }
+  ::-webkit-scrollbar-thumb:hover { background: var(--cyan-dim); }
+
+  .mono { font-family: var(--mono); }
+  .label { text-transform: uppercase; letter-spacing: .12em; font-size: 10.5px; font-family: var(--mono); color: var(--text-faint); }
+
+  /* ════ LOGIN ════ */
+  #login { min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+  .login-card {
+    background: linear-gradient(160deg, var(--panel-2), var(--panel));
+    border: 1px solid var(--line); border-radius: 4px; padding: 38px 40px; width: 380px;
+    position: relative; box-shadow: 0 0 0 1px rgba(0,233,255,.06), 0 24px 60px rgba(0,0,0,.6);
+  }
+  .login-card::before {
+    content: ""; position: absolute; top: 0; left: 0; right: 0; height: 2px;
+    background: linear-gradient(90deg, transparent, var(--cyan), var(--magenta), transparent);
+    box-shadow: var(--glow-cyan);
+  }
+  .brand-mark { display: flex; align-items: center; gap: 11px; margin-bottom: 4px; }
+  .brand-mark svg { filter: drop-shadow(0 0 6px rgba(0,233,255,.6)); }
+  .brand-mark .nm { font-family: var(--mono); font-size: 19px; font-weight: 600; letter-spacing: .04em; }
+  .brand-mark .nm b { color: var(--cyan); text-shadow: var(--glow-cyan); font-weight: 600; }
+  .login-card .sub { color: var(--text-dim); font-size: 11px; margin-bottom: 30px; font-family: var(--mono); letter-spacing: .14em; text-transform: uppercase; }
+  .field { margin-bottom: 16px; }
+  .field label { display: block; margin-bottom: 7px; }
+  .field input {
+    width: 100%; padding: 11px 13px; background: var(--bg); border: 1px solid var(--line);
+    border-radius: 3px; color: var(--text); transition: all .15s;
+  }
+  .field input:focus { outline: none; border-color: var(--cyan); box-shadow: var(--glow-cyan); }
+  .btn {
+    padding: 10px 16px; border: 1px solid var(--line); border-radius: 3px; background: var(--panel-3);
+    color: var(--text); font-weight: 500; transition: all .14s; letter-spacing: .02em;
+  }
+  .btn:hover { border-color: var(--cyan); color: #fff; box-shadow: var(--glow-cyan); }
+  .btn-primary {
+    background: linear-gradient(180deg, rgba(0,233,255,.18), rgba(0,184,204,.08));
+    border-color: var(--cyan-dim); color: var(--cyan); font-family: var(--mono);
+    text-transform: uppercase; letter-spacing: .1em; font-size: 12px;
+  }
+  .btn-primary:hover { background: rgba(0,233,255,.28); color: #fff; box-shadow: var(--glow-cyan); }
+  .btn-full { width: 100%; }
+  .btn-sm { padding: 6px 11px; font-size: 11.5px; }
+  .btn-danger { color: var(--magenta); border-color: rgba(255,45,120,.4); }
+  .btn-danger:hover { border-color: var(--magenta); color: #fff; box-shadow: var(--glow-mag); }
+  .err { color: var(--crit); font-size: 12.5px; margin-top: 12px; min-height: 18px; font-family: var(--mono); }
+
+  /* ════ SHELL (Elastic layout) ════ */
+  #app { display: none; height: 100vh; grid-template-columns: 220px 1fr; grid-template-rows: 52px 1fr; grid-template-areas: "logo header" "nav main"; }
+
+  .logo-cell {
+    grid-area: logo; display: flex; align-items: center; gap: 10px; padding: 0 18px;
+    border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); background: var(--panel);
+  }
+  .logo-cell svg { filter: drop-shadow(0 0 5px rgba(0,233,255,.6)); }
+  .logo-cell .nm { font-family: var(--mono); font-weight: 600; font-size: 14px; letter-spacing: .03em; }
+  .logo-cell .nm b { color: var(--cyan); text-shadow: var(--glow-cyan); }
+
+  .header {
+    grid-area: header; display: flex; align-items: center; justify-content: space-between;
+    padding: 0 22px; border-bottom: 1px solid var(--line); background: var(--panel);
+    position: relative;
+  }
+  .header::after { content: ""; position: absolute; left: 0; right: 0; bottom: -1px; height: 1px; background: linear-gradient(90deg, var(--cyan), transparent 60%); opacity: .5; }
+  .header .crumb { font-family: var(--mono); font-size: 12px; color: var(--text-dim); letter-spacing: .08em; text-transform: uppercase; }
+  .header .crumb .sec { color: var(--text); }
+  .header .right { display: flex; align-items: center; gap: 16px; }
+  .live { display: flex; align-items: center; gap: 7px; font-family: var(--mono); font-size: 10.5px; letter-spacing: .12em; color: var(--green); text-transform: uppercase; }
+  .live .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 8px var(--green); animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+  .header .who { font-family: var(--mono); font-size: 12.5px; color: var(--text); }
+  .role-badge { padding: 2px 8px; border-radius: 3px; font-size: 10px; background: rgba(160,107,255,.12); border: 1px solid rgba(160,107,255,.4); color: var(--violet); text-transform: uppercase; letter-spacing: .08em; font-family: var(--mono); }
+  .icon-btn { background: none; border: 1px solid var(--line); border-radius: 3px; color: var(--text-dim); width: 30px; height: 30px; display: inline-flex; align-items: center; justify-content: center; transition: all .14s; }
+  .icon-btn:hover { border-color: var(--cyan); color: var(--cyan); box-shadow: var(--glow-cyan); }
+  .btn-run { background: linear-gradient(180deg, rgba(0,233,255,.15), rgba(0,184,204,.06)); border-color: var(--cyan-dim); color: var(--cyan); font-family: var(--mono); text-transform: uppercase; letter-spacing: .08em; font-size: 11px; }
+  .btn-run:hover { background: rgba(0,233,255,.26); color: #fff; box-shadow: var(--glow-cyan); }
+
+  .run-overlay { display: none; position: fixed; inset: 0; background: rgba(2,4,10,.6); z-index: 60; backdrop-filter: blur(2px); }
+  .run-overlay.open { display: flex; align-items: flex-start; justify-content: center; padding-top: 70px; }
+  .run-panel { width: 420px; max-width: 92vw; background: linear-gradient(160deg, var(--panel-2), var(--panel)); border: 1px solid var(--cyan); border-radius: 5px; box-shadow: 0 20px 60px rgba(0,0,0,.6), 0 0 14px rgba(0,233,255,.15); overflow: hidden; }
+  .run-head { display: flex; justify-content: space-between; align-items: center; padding: 15px 18px; border-bottom: 1px solid var(--line); background: var(--panel-2); }
+  .run-title { font-family: var(--mono); font-size: 12px; text-transform: uppercase; letter-spacing: .1em; color: var(--cyan); text-shadow: var(--glow-cyan); }
+  .run-head .x { background: none; border: 1px solid var(--line); border-radius: 3px; color: var(--text-dim); font-size: 18px; line-height: 1; width: 28px; height: 28px; }
+  .run-head .x:hover { border-color: var(--magenta); color: var(--magenta); }
+  .run-body { padding: 18px; }
+  .run-body .label { display: block; margin-bottom: 7px; }
+  .run-body select { width: 100%; padding: 9px 11px; background: var(--bg); border: 1px solid var(--line); border-radius: 3px; color: var(--text); margin-bottom: 16px; }
+  .run-body select:focus { outline: none; border-color: var(--cyan); box-shadow: var(--glow-cyan); }
+  .run-check { display: flex; align-items: center; gap: 8px; font-size: 13px; margin-bottom: 14px; cursor: pointer; }
+  .run-check input { accent-color: var(--cyan); width: 15px; height: 15px; }
+  .run-note { font-size: 11.5px; line-height: 1.5; margin-bottom: 16px; padding: 9px 11px; background: var(--bg); border: 1px solid var(--line-soft); border-left: 2px solid var(--amber); border-radius: 3px; }
+  .ob-in { width: 100%; padding: 9px 11px; background: var(--bg); border: 1px solid var(--line); border-radius: 3px; color: var(--text); }
+  .ob-in:focus { outline: none; border-color: var(--cyan); box-shadow: var(--glow-cyan); }
+  textarea.ob-in { font-family: var(--mono); font-size: 12px; }
+  .ob-staged { margin-top: 14px; display: flex; flex-direction: column; gap: 4px; max-height: 160px; overflow-y: auto; }
+  .ob-staged:empty { display: none; }
+  .ob-chip { display: flex; align-items: center; justify-content: space-between; padding: 6px 10px; background: var(--bg); border: 1px solid var(--line-soft); border-radius: 3px; font-family: var(--mono); font-size: 12px; }
+  .ob-chip .d { color: var(--cyan); }
+  .ob-chip .t { font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-faint); margin-left: 8px; }
+  .ob-chip .t.watchlist { color: var(--violet); }
+  .ob-chip .rm { background: none; border: none; color: var(--text-faint); cursor: pointer; font-size: 15px; line-height: 1; padding: 0 0 0 8px; }
+  .ob-chip .rm:hover { color: var(--magenta); }
+  .btn-promote { width: 100%; color: var(--green); border-color: rgba(33,230,164,.4); }
+  .btn-promote:hover { border-color: var(--green); color: #fff; box-shadow: 0 0 8px rgba(33,230,164,.4); }
+  .he-details { margin-top: 6px; }
+  .he-details summary { cursor: pointer; color: var(--cyan); font-size: 11px; font-family: var(--mono); text-transform: uppercase; letter-spacing: .06em; }
+  .he-details summary:hover { text-shadow: var(--glow-cyan); }
+  .he-details[open] summary { margin-bottom: 8px; }
+  .he-sum { font-size: 12px; color: var(--text-dim); margin: 6px 0; }
+  .he-grp { font-family: var(--mono); font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-faint); margin: 8px 0 4px; }
+  .he-item { font-family: var(--mono); font-size: 11px; color: var(--text-dim); padding: 2px 0; word-break: break-all; border-left: 2px solid var(--line-soft); padding-left: 8px; margin-bottom: 2px; }
+  .clients-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 16px; }
+  .client-card { background: linear-gradient(160deg, var(--panel-2), var(--panel)); border: 1px solid var(--line); border-radius: 5px; padding: 18px; }
+  .client-card:hover { border-color: var(--cyan-dim); }
+  .client-card .cc-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 4px; }
+  .client-card .cc-name { font-size: 16px; font-weight: 600; color: var(--text); }
+  .client-card .cc-legit { font-family: var(--mono); font-size: 12px; color: var(--cyan); margin-bottom: 12px; }
+  .client-card .cc-cases { font-family: var(--mono); font-size: 11px; color: var(--text-faint); }
+  .client-card .cc-cases b { color: var(--amber); }
+  .client-card .cc-grp { font-family: var(--mono); font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-faint); margin: 12px 0 6px; }
+  .client-card .cc-dom { display: flex; align-items: center; justify-content: space-between; padding: 5px 9px; background: var(--bg); border: 1px solid var(--line-soft); border-radius: 3px; font-family: var(--mono); font-size: 12px; margin-bottom: 4px; }
+  .client-card .cc-dom .rm { background: none; border: none; color: var(--text-faint); cursor: pointer; font-size: 14px; padding: 0 0 0 8px; }
+  .client-card .cc-dom .rm:hover { color: var(--magenta); }
+  .client-card .cc-note { font-size: 12px; color: var(--text-dim); margin-top: 10px; padding: 8px 10px; background: var(--bg); border-left: 2px solid var(--line-soft); border-radius: 3px; }
+  .client-card .cc-actions { display: flex; gap: 8px; margin-top: 14px; }
+  .client-card .cc-empty { font-size: 12px; color: var(--text-faint); font-style: italic; }
+  .prog-wrap { max-width: 880px; }
+  .prog-status { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+  .prog-phase { font-family: var(--mono); font-size: 13px; text-transform: uppercase; letter-spacing: .1em; padding: 4px 12px; border-radius: 3px; border: 1px solid var(--line); color: var(--text-dim); }
+  .prog-phase.scanning, .prog-phase.dnstwist, .prog-phase.starting { color: var(--cyan); border-color: var(--cyan-dim); box-shadow: var(--glow-cyan); }
+  .prog-phase.done { color: var(--green); border-color: rgba(33,230,164,.4); }
+  .prog-phase.error { color: var(--magenta); border-color: var(--magenta); }
+  .prog-client { font-family: var(--mono); font-size: 13px; color: var(--text); }
+  .prog-bar { height: 10px; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+  .prog-fill { height: 100%; background: linear-gradient(90deg, var(--cyan-dim), var(--cyan)); box-shadow: var(--glow-cyan); transition: width .4s ease; }
+  .prog-meta { display: flex; justify-content: space-between; font-family: var(--mono); font-size: 12px; color: var(--text-dim); margin: 8px 0 24px; }
+  .prog-log-head { font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-faint); margin-bottom: 8px; }
+  .prog-log { background: var(--bg); border: 1px solid var(--line); border-radius: 4px; padding: 12px 14px; height: 360px; overflow-y: auto; font-family: var(--mono); font-size: 12px; line-height: 1.6; }
+  .prog-log .ln { color: var(--text-dim); white-space: pre-wrap; word-break: break-word; }
+  .prog-log .ln .t { color: var(--text-faint); margin-right: 8px; }
+
+  /* ── Sidebar nav ── */
+  .nav { grid-area: nav; border-right: 1px solid var(--line); background: var(--panel); display: flex; flex-direction: column; overflow-y: auto; }
+  .nav-group { padding: 16px 12px 6px; }
+  .nav-group .label { padding: 0 10px 8px; }
+  .nav-item {
+    display: flex; align-items: center; gap: 11px; padding: 9px 12px; border-radius: 4px;
+    color: var(--text-dim); cursor: pointer; font-size: 13px; position: relative; transition: all .12s; margin-bottom: 2px;
+  }
+  .nav-item svg { flex-shrink: 0; opacity: .8; }
+  .nav-item:hover { background: var(--panel-2); color: var(--text); }
+  .nav-item .count { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--text-faint); background: var(--panel-3); padding: 1px 7px; border-radius: 9px; }
+  .nav-item.active { background: linear-gradient(90deg, rgba(0,233,255,.1), transparent); color: var(--cyan); }
+  .nav-item.active::before { content: ""; position: absolute; left: 0; top: 6px; bottom: 6px; width: 2px; background: var(--cyan); box-shadow: var(--glow-cyan); border-radius: 2px; }
+  .nav-item.active svg { opacity: 1; }
+  .nav-item.crit.active { color: var(--crit); }
+  .nav-item.crit.active::before { background: var(--crit); box-shadow: var(--glow-mag); }
+  .nav-spacer { flex: 1; }
+  .nav-foot { padding: 14px; border-top: 1px solid var(--line-soft); }
+  .nav-foot .u { font-family: var(--mono); font-size: 12px; color: var(--text); display: flex; align-items: center; gap: 8px; }
+  .nav-foot .u .av { width: 24px; height: 24px; border-radius: 3px; background: linear-gradient(135deg, var(--cyan-dim), var(--violet)); display: flex; align-items: center; justify-content: center; font-size: 11px; color: #04121a; font-weight: 700; }
+  .nav-foot .logout { margin-top: 10px; }
+
+  /* ── Main ── */
+  .main { grid-area: main; overflow-y: auto; padding: 22px 26px 60px; }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(158px, 1fr)); gap: 12px; margin-bottom: 26px; }
+  .card {
+    background: linear-gradient(160deg, var(--panel-2), var(--panel)); border: 1px solid var(--line);
+    border-radius: 4px; padding: 15px 17px; position: relative; overflow: hidden;
+  }
+  .card::after { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 2px; background: var(--line); }
+  .card .n { font-family: var(--mono); font-size: 30px; font-weight: 600; line-height: 1; }
+  .card .l { font-size: 11px; color: var(--text-dim); margin-top: 8px; font-family: var(--mono); letter-spacing: .06em; text-transform: uppercase; }
+  .card.alert::after { background: var(--crit); box-shadow: var(--glow-mag); }
+  .card.alert .n { color: var(--crit); text-shadow: var(--glow-mag); }
+  .card.warn::after { background: var(--amber); }
+  .card.ok::after { background: var(--cyan); box-shadow: var(--glow-cyan); }
+  .card.ok .n { color: var(--cyan); text-shadow: var(--glow-cyan); }
+
+  .toolbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+  .toolbar .ttl { font-family: var(--mono); font-size: 13px; letter-spacing: .1em; text-transform: uppercase; color: var(--text); display: flex; align-items: center; gap: 9px; }
+  .toolbar .ttl .bar { width: 3px; height: 14px; background: var(--cyan); box-shadow: var(--glow-cyan); }
+
+  .filters { display: flex; gap: 9px; flex-wrap: wrap; margin-bottom: 14px; }
+  .filters select, .filters input {
+    padding: 8px 11px; background: var(--panel); border: 1px solid var(--line); border-radius: 3px; color: var(--text);
+  }
+  .filters select:focus, .filters input:focus { outline: none; border-color: var(--cyan); box-shadow: var(--glow-cyan); }
+  .filters input { min-width: 200px; }
+  .group-toggle { display: inline-flex; align-items: center; gap: 7px; padding: 8px 11px; font-size: 13px; color: var(--text-dim); cursor: pointer; user-select: none; }
+  .group-toggle input { accent-color: var(--cyan); width: 15px; height: 15px; }
+  .group-toggle:hover { color: var(--cyan); }
+  tr.group-head { cursor: pointer; background: var(--panel-2); }
+  tr.group-head:hover { background: rgba(0,233,255,.05); }
+  tr.group-head td { padding: 10px 15px; border-bottom: 1px solid var(--line); border-top: 1px solid var(--line); }
+  .gcaret { color: var(--cyan); font-size: 11px; margin-right: 8px; }
+  .gname { font-weight: 600; color: var(--text); font-size: 14px; }
+  .gcount { font-family: var(--mono); font-size: 11px; color: var(--text-faint); margin-left: 10px; }
+  .gdots { float: right; display: inline-flex; gap: 8px; }
+  .gsev { font-family: var(--mono); font-size: 10px; text-transform: uppercase; letter-spacing: .05em; padding: 2px 7px; border-radius: 3px; }
+  .gsev.sev-CRITICAL { color: var(--magenta); border: 1px solid var(--magenta); }
+  .gsev.sev-HIGH { color: var(--high, #ff9d3c); border: 1px solid var(--high, #ff9d3c); }
+  .gsev.sev-MEDIUM { color: var(--amber); border: 1px solid rgba(240,180,60,.5); }
+  .gsev.sev-LOW { color: var(--text-faint); border: 1px solid var(--line); }
+
+  .table-wrap { background: var(--panel); border: 1px solid var(--line); border-radius: 4px; overflow: hidden; }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; padding: 11px 15px; font-family: var(--mono); font-size: 10.5px; text-transform: uppercase; letter-spacing: .1em; color: var(--text-faint); border-bottom: 1px solid var(--line); background: var(--panel-2); }
+  td { padding: 12px 15px; border-bottom: 1px solid var(--line-soft); }
+  tbody tr { cursor: pointer; transition: background .1s; position: relative; }
+  tbody tr:hover { background: var(--panel-2); box-shadow: inset 2px 0 0 var(--cyan); }
+  tbody tr:last-child td { border-bottom: none; }
+  .domain { font-family: var(--mono); font-size: 13px; color: var(--cyan); }
+  .muted { color: var(--text-dim); }
+  .empty { padding: 54px; text-align: center; color: var(--text-faint); font-family: var(--mono); letter-spacing: .05em; }
+
+  /* ── Badges (neon) ── */
+  .badge { display: inline-block; padding: 2px 9px; border-radius: 3px; font-size: 10.5px; font-weight: 600; border: 1px solid transparent; white-space: nowrap; font-family: var(--mono); letter-spacing: .04em; }
+  .sev-CRITICAL { color: var(--crit); border-color: var(--crit); background: rgba(255,46,99,.1); text-shadow: 0 0 6px rgba(255,46,99,.6); box-shadow: 0 0 7px rgba(255,46,99,.2); }
+  .sev-HIGH { color: var(--high); border-color: var(--high); background: rgba(255,140,26,.1); text-shadow: 0 0 6px rgba(255,140,26,.5); }
+  .sev-MEDIUM { color: var(--med); border-color: var(--med); background: rgba(255,214,10,.1); }
+  .sev-LOW { color: var(--low); border-color: var(--low); background: rgba(0,233,255,.1); }
+  .st-new { color: var(--cyan); border-color: var(--cyan); background: rgba(0,233,255,.08); }
+  .st-in_progress { color: var(--amber); border-color: var(--amber); background: rgba(255,176,32,.08); }
+  .st-closed_tp { color: var(--crit); border-color: rgba(255,46,99,.5); }
+  .st-closed_fp { color: var(--text-dim); border-color: var(--line); }
+  .st-closed_benign { color: var(--green); border-color: rgba(33,230,164,.45); background: rgba(33,230,164,.06); }
+
+  /* ── Drawer ── */
+  .overlay { display: none; position: fixed; inset: 0; background: rgba(2,4,10,.7); z-index: 50; backdrop-filter: blur(2px); }
+  .overlay.open { display: block; }
+  .drawer {
+    position: fixed; top: 0; right: 0; height: 100%; width: 580px; max-width: 94vw;
+    background: linear-gradient(180deg, var(--panel-2), var(--panel)); border-left: 1px solid var(--cyan);
+    box-shadow: -12px 0 40px rgba(0,0,0,.6), -1px 0 12px rgba(0,233,255,.15);
+    z-index: 51; transform: translateX(100%); transition: transform .22s ease; overflow-y: auto;
+  }
+  .drawer.open { transform: translateX(0); }
+  .drawer-head { padding: 20px 24px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--panel-2); display: flex; justify-content: space-between; align-items: flex-start; z-index: 2; }
+  .drawer-head .x { background: none; border: 1px solid var(--line); border-radius: 3px; color: var(--text-dim); font-size: 18px; line-height: 1; width: 30px; height: 30px; }
+  .drawer-head .x:hover { border-color: var(--magenta); color: var(--magenta); box-shadow: var(--glow-mag); }
+  .drawer-body { padding: 22px 24px; }
+  .kv { display: grid; grid-template-columns: 120px 1fr; gap: 9px 16px; margin-bottom: 18px; }
+  .kv dt { color: var(--text-faint); font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; padding-top: 1px; }
+  .kv dd { font-size: 13px; word-break: break-word; }
+  .rationale { background: var(--bg); border: 1px solid var(--line-soft); border-left: 2px solid var(--violet); border-radius: 3px; padding: 12px 14px; font-size: 13px; color: var(--text-dim); margin-bottom: 18px; }
+  .block-title { font-family: var(--mono); font-size: 10.5px; text-transform: uppercase; letter-spacing: .12em; color: var(--cyan); margin: 22px 0 12px; border-top: 1px solid var(--line-soft); padding-top: 16px; }
+  .note, .hist { padding: 11px 13px; background: var(--bg); border: 1px solid var(--line-soft); border-radius: 3px; margin-bottom: 8px; font-size: 13px; }
+  .note { border-left: 2px solid var(--cyan-dim); }
+  .note .meta, .hist .meta { color: var(--text-faint); font-size: 10.5px; margin-top: 6px; font-family: var(--mono); letter-spacing: .04em; }
+  .hist { color: var(--text-dim); border-left: 2px solid var(--line); }
+
+  .action-row { display: flex; gap: 8px; margin-bottom: 10px; }
+  .action-row select, .action-row input { flex: 1; padding: 8px 11px; background: var(--bg); border: 1px solid var(--line); border-radius: 3px; color: var(--text); }
+  .action-row select:focus, .action-row input:focus, .note-in:focus { outline: none; border-color: var(--cyan); box-shadow: var(--glow-cyan); }
+  textarea.note-in { width: 100%; min-height: 62px; padding: 10px 12px; background: var(--bg); border: 1px solid var(--line); border-radius: 3px; color: var(--text); resize: vertical; margin-bottom: 8px; }
+
+  .toast { position: fixed; bottom: 26px; left: 50%; transform: translateX(-50%); background: var(--panel-3); border: 1px solid var(--line); border-radius: 3px; padding: 12px 22px; z-index: 100; opacity: 0; transition: opacity .2s; pointer-events: none; font-size: 13px; font-family: var(--mono); }
+  .toast.show { opacity: 1; }
+  .toast.ok { border-color: var(--green); box-shadow: 0 0 12px rgba(33,230,164,.3); color: var(--green); }
+  .toast.bad { border-color: var(--crit); box-shadow: var(--glow-mag); color: var(--crit); }
+
+  /* ── Drawer tabs ── */
+  .tabs { display: flex; gap: 2px; padding: 0 24px; background: var(--panel-2); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 2; }
+  .tab { background: none; border: none; color: var(--text-dim); padding: 12px 16px; font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; border-bottom: 2px solid transparent; transition: all .12s; }
+  .tab:hover { color: var(--text); }
+  .tab.active { color: var(--cyan); border-bottom-color: var(--cyan); text-shadow: var(--glow-cyan); }
+  .tab-pane { display: none; }
+  .tab-pane.active { display: block; }
+
+  .intel-search { margin-bottom: 14px; }
+  .intel-search input { width: 100%; padding: 8px 11px; background: var(--bg); border: 1px solid var(--line); border-radius: 3px; color: var(--text); font-family: var(--mono); font-size: 12px; }
+  .intel-search input:focus { outline: none; border-color: var(--cyan); box-shadow: var(--glow-cyan); }
+  .itable { width: 100%; border-collapse: collapse; margin-bottom: 6px; }
+  .itable th { text-align: left; padding: 6px 10px; font-family: var(--mono); font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-faint); border-bottom: 1px solid var(--line-soft); }
+  .itable td { padding: 7px 10px; border-bottom: 1px solid var(--line-soft); font-size: 12.5px; vertical-align: top; }
+  .itable .ik { color: var(--text-dim); font-family: var(--mono); font-size: 11px; width: 110px; text-transform: uppercase; letter-spacing: .04em; }
+  .itable .iv { word-break: break-word; }
+  .itable .mono { font-family: var(--mono); font-size: 12px; }
+  .flag-yes { color: var(--green); font-family: var(--mono); font-size: 12px; }
+  .flag-no { color: var(--text-faint); font-family: var(--mono); font-size: 12px; }
+
+  .diff-entry { background: var(--bg); border: 1px solid var(--line-soft); border-left: 2px solid var(--amber); border-radius: 3px; padding: 10px 12px; margin-bottom: 8px; }
+  .diff-head { margin-bottom: 6px; font-size: 12px; }
+  .diff-alert { font-family: var(--mono); font-size: 12px; color: var(--text-dim); padding: 2px 0; }
+
+  .raw-toolbar { margin-bottom: 10px; }
+  .raw-json { background: var(--bg); border: 1px solid var(--line-soft); border-radius: 3px; padding: 14px; font-family: var(--mono); font-size: 11.5px; color: var(--cyan); overflow-x: auto; white-space: pre; max-height: 60vh; overflow-y: auto; line-height: 1.5; }
+  code { font-family: var(--mono); background: var(--panel-3); padding: 1px 5px; border-radius: 3px; color: var(--cyan); font-size: 12px; }
+
+  @media (max-width: 820px) {
+    #app { grid-template-columns: 1fr; grid-template-areas: "logo" "header" "main"; grid-template-rows: 52px 52px 1fr; }
+    .nav { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<!-- ════ LOGIN ════ -->
+<div id="login">
+  <div class="login-card">
+    <div class="brand-mark">
+      <svg width="26" height="26" viewBox="0 0 24 24" fill="none"><path d="M12 2l8.5 4.9v9.8L12 21.6 3.5 16.7V6.9L12 2z" stroke="#00e9ff" stroke-width="1.4"/><path d="M12 7l4.3 2.5v4.9L12 17l-4.3-2.6V9.5L12 7z" fill="#00e9ff" fill-opacity=".18" stroke="#00e9ff" stroke-width="1"/></svg>
+      <div class="nm">DOMAIN<b>SENTRY</b></div>
+    </div>
+    <div class="sub">SOC Triage Console</div>
+    <div class="field">
+      <label class="label">Operator</label>
+      <input id="lg-user" type="text" autocomplete="username" autofocus>
+    </div>
+    <div class="field">
+      <label class="label">Passphrase</label>
+      <input id="lg-pass" type="password" autocomplete="current-password">
+    </div>
+    <button class="btn btn-primary btn-full" onclick="doLogin()">Authenticate</button>
+    <div class="err" id="lg-err"></div>
+  </div>
+</div>
+
+<!-- ════ APP ════ -->
+<div id="app">
+  <div class="logo-cell">
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none"><path d="M12 2l8.5 4.9v9.8L12 21.6 3.5 16.7V6.9L12 2z" stroke="#00e9ff" stroke-width="1.4"/><path d="M12 7l4.3 2.5v4.9L12 17l-4.3-2.6V9.5L12 7z" fill="#00e9ff" fill-opacity=".2" stroke="#00e9ff" stroke-width="1"/></svg>
+    <div class="nm">DOMAIN<b>SENTRY</b></div>
+  </div>
+
+  <div class="header">
+    <div class="crumb">Triage <span style="opacity:.4">/</span> <span class="sec" id="crumb-sec">Overview</span></div>
+    <div class="right">
+      <div class="live"><span class="dot"></span> Live</div>
+      <button class="btn btn-sm btn-run" id="run-scan-btn" style="display:none" onclick="toggleRunPanel()">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:5px"><polygon points="5 3 19 12 5 21 5 3"/></svg>Run scan
+      </button>
+      <button class="icon-btn" title="Refresh" onclick="loadAll()">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-2.6-6.4"/><path d="M21 3v6h-6"/></svg>
+      </button>
+      <span class="who" id="who"></span>
+      <span class="role-badge" id="who-role"></span>
+    </div>
+  </div>
+
+  <!-- Run scan panel -->
+  <div class="run-overlay" id="run-overlay" onclick="if(event.target===this)toggleRunPanel()">
+    <div class="run-panel">
+      <div class="run-head">
+        <span class="run-title">Run scan</span>
+        <button class="x" onclick="toggleRunPanel()">&times;</button>
+      </div>
+      <div class="run-body">
+        <label class="label">Client</label>
+        <select id="run-client"><option value="">All clients</option></select>
+        <label class="label" style="margin-top:14px">Scope</label>
+        <select id="run-scope">
+          <option value="all">All domains (target + watchlist)</option>
+          <option value="target">Target only</option>
+          <option value="watchlist">Watchlist only</option>
+        </select>
+        <label class="run-check" style="margin-top:14px"><input type="checkbox" id="run-twist"> Include dnstwist <span class="muted">(slower — discovers new variants)</span></label>
+        <label class="run-check" id="run-vintel-row" style="display:none"><input type="checkbox" id="run-vintel"> Collect full intel on variants <span class="muted">(DNS/MX/site/cert for each — needed to triage tp/fp)</span></label>
+        <div class="run-note muted" id="run-note">A scan takes ~100s per client; with dnstwist, several minutes. Collecting variant intel adds time per registered variant. Cases appear automatically when it finishes.</div>
+        <button class="btn btn-primary btn-full" id="run-go" onclick="launchScan()">Launch scan</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Sidebar -->
+  <div class="nav">
+    <div class="nav-group">
+      <div class="label">Views</div>
+      <div class="nav-item active" data-view="overview" onclick="setView('overview')">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+        Overview
+      </div>
+      <div class="nav-item" data-view="all" onclick="setView('all')">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
+        All cases <span class="count" id="c-all"></span>
+      </div>
+    </div>
+    <div class="nav-group">
+      <div class="label">Queues</div>
+      <div class="nav-item" data-view="new" onclick="setView('new')">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8"/></svg>
+        New <span class="count" id="c-new"></span>
+      </div>
+      <div class="nav-item" data-view="progress" onclick="setView('progress')">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+        In progress <span class="count" id="c-prog"></span>
+      </div>
+      <div class="nav-item crit" data-view="critical" onclick="setView('critical')">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3l9 16H3L12 3z"/><path d="M12 10v4M12 17h.01"/></svg>
+        Critical <span class="count" id="c-crit"></span>
+      </div>
+      <div class="nav-item" data-view="mine" onclick="setView('mine')">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="8" r="4"/><path d="M4 21v-1a7 7 0 0 1 14 0v1"/></svg>
+        My cases <span class="count" id="c-mine"></span>
+      </div>
+    </div>
+    <div class="nav-group" id="nav-manage" style="display:none">
+      <div class="label">Manage</div>
+      <div class="nav-item" id="nav-clients" onclick="showClients()">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+        Clients
+      </div>
+      <div class="nav-item" id="nav-progress" onclick="showProgress()">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+        Scan progress
+      </div>
+      <div class="nav-item" onclick="openOnboard()">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="9" cy="8" r="4"/><path d="M3 21v-1a6 6 0 0 1 10-4.5"/><line x1="17" y1="11" x2="17" y2="17"/><line x1="14" y1="14" x2="20" y2="14"/></svg>
+        Onboard client
+      </div>
+      <div class="nav-item" onclick="openAddDomain()">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8"/></svg>
+        Add domain
+      </div>
+    </div>
+    <div class="nav-spacer"></div>
+    <div class="nav-foot">
+      <div class="u"><span class="av" id="av"></span><span id="nav-user"></span></div>
+      <button class="btn btn-sm btn-full logout" onclick="doLogout()">Sign out</button>
+    </div>
+  </div>
+
+  <!-- Onboard client panel -->
+  <div class="run-overlay" id="ob-overlay" onclick="if(event.target===this)closeOnboard()">
+    <div class="run-panel" style="width:520px">
+      <div class="run-head">
+        <span class="run-title">Onboard client</span>
+        <button class="x" onclick="closeOnboard()">&times;</button>
+      </div>
+      <div class="run-body">
+        <div style="display:flex;gap:12px">
+          <div style="flex:1">
+            <label class="label">Client name</label>
+            <input id="ob-client" type="text" placeholder="e.g. acme" class="ob-in">
+          </div>
+          <div style="flex:1">
+            <label class="label">Legitimate domain</label>
+            <input id="ob-legit" type="text" placeholder="e.g. acme.com" class="ob-in">
+          </div>
+        </div>
+        <label class="label" style="margin-top:14px">Notes <span class="muted">(optional)</span></label>
+        <textarea id="ob-notes" class="ob-in" placeholder="contact, sector, context…" style="min-height:48px;resize:vertical"></textarea>
+
+        <label class="label" style="margin-top:16px">Add domain</label>
+        <div style="display:flex;gap:8px">
+          <input id="ob-one" type="text" placeholder="look-alike domain…" class="ob-in" style="flex:1;margin:0" onkeydown="if(event.key==='Enter')obAddOne()">
+          <select id="ob-one-type" class="ob-in" style="width:120px;margin:0"><option value="target">target</option><option value="watchlist">watchlist</option></select>
+          <button class="btn btn-sm" onclick="obAddOne()">Add</button>
+        </div>
+
+        <label class="label" style="margin-top:14px">Or paste a list <span class="muted">(one per line)</span></label>
+        <div style="display:flex;gap:8px;align-items:flex-start">
+          <textarea id="ob-bulk" class="ob-in" placeholder="acrne.com&#10;acme-login.com&#10;…" style="flex:1;min-height:70px;margin:0;resize:vertical"></textarea>
+          <select id="ob-bulk-type" class="ob-in" style="width:120px;margin:0"><option value="target">target</option><option value="watchlist">watchlist</option></select>
+          <button class="btn btn-sm" onclick="obAddBulk()">Add all</button>
+        </div>
+
+        <div class="ob-staged" id="ob-staged"></div>
+        <button class="btn btn-primary btn-full" id="ob-go" style="margin-top:14px" onclick="submitOnboard()">Onboard client</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Add domain to existing client -->
+  <div class="run-overlay" id="ad-overlay" onclick="if(event.target===this)closeAddDomain()">
+    <div class="run-panel">
+      <div class="run-head">
+        <span class="run-title">Add domain</span>
+        <button class="x" onclick="closeAddDomain()">&times;</button>
+      </div>
+      <div class="run-body">
+        <label class="label">Client</label>
+        <select id="ad-client" class="ob-in"></select>
+        <label class="label" style="margin-top:14px">Domain</label>
+        <input id="ad-domain" type="text" placeholder="look-alike domain…" class="ob-in" onkeydown="if(event.key==='Enter')submitAddDomain()">
+        <label class="label" style="margin-top:14px">Type</label>
+        <select id="ad-type" class="ob-in"><option value="target">target (actively monitored)</option><option value="watchlist">watchlist</option></select>
+        <div class="run-note muted" style="margin-top:14px">The client's legitimate domain is resolved automatically. Added domains are included in the next scan.</div>
+        <button class="btn btn-primary btn-full" id="ad-go" onclick="submitAddDomain()">Add to client</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Main -->
+  <div class="main">
+    <div id="case-view">
+    <div class="cards" id="cards"></div>
+
+    <div class="toolbar">
+      <div class="ttl"><span class="bar"></span> <span id="view-title">Case Queue</span></div>
+    </div>
+
+    <div class="filters">
+      <select id="f-status" onchange="loadCases()">
+        <option value="">All statuses</option>
+        <option value="new">New</option>
+        <option value="in_progress">In progress</option>
+        <option value="closed_tp">Closed — True Positive</option>
+        <option value="closed_fp">Closed — False Positive</option>
+        <option value="closed_benign">Closed — Benign</option>
+      </select>
+      <select id="f-sev" onchange="loadCases()">
+        <option value="">All severities</option>
+        <option value="CRITICAL">Critical</option>
+        <option value="HIGH">High</option>
+        <option value="MEDIUM">Medium</option>
+        <option value="LOW">Low</option>
+      </select>
+      <input id="f-client" type="text" placeholder="filter by client…" oninput="debouncedCases()">
+      <label class="group-toggle"><input type="checkbox" id="f-group" onchange="loadCases()"> Group by client</label>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Domain</th><th>Client</th><th>Classification</th><th>Severity</th><th>Status</th><th>Assignee</th><th>Updated</th></tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+      <div class="empty" id="empty" style="display:none">// no cases match current filters</div>
+    </div>
+    </div>
+
+    <div id="clients-view" style="display:none">
+      <div class="toolbar">
+        <div class="ttl"><span class="bar"></span> Clients</div>
+      </div>
+      <div id="clients-grid" class="clients-grid"></div>
+    </div>
+
+    <div id="progress-view" style="display:none">
+      <div class="toolbar">
+        <div class="ttl"><span class="bar"></span> Scan progress</div>
+      </div>
+      <div class="prog-wrap">
+        <div class="prog-status">
+          <span class="prog-phase" id="prog-phase">idle</span>
+          <span class="prog-client" id="prog-client"></span>
+        </div>
+        <div class="prog-bar"><div class="prog-fill" id="prog-fill" style="width:0%"></div></div>
+        <div class="prog-meta">
+          <span id="prog-counts">—</span>
+          <span id="prog-current"></span>
+        </div>
+        <div class="prog-log-head">Pipeline log</div>
+        <div class="prog-log" id="prog-log"><div class="muted">no active scan</div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ════ DRAWER ════ -->
+<div class="overlay" id="overlay" onclick="closeDrawer()"></div>
+<div class="drawer" id="drawer"></div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+const API = "";
+let TOKEN = sessionStorage.getItem("ds_token") || null;
+let ME = null;
+let ASSIGNABLE = [];
+let CURRENT = null;
+let VIEW = "overview";
+let viewAssignee = null;  // sidebar "My cases" filter; must exist before first loadCases()
+const VIEW_TITLES = { overview: "Case Queue", all: "All Cases", new: "New", progress: "In Progress", critical: "Critical Severity", mine: "My Cases" };
+
+const $ = id => document.getElementById(id);
+const esc = s => (s == null ? "" : String(s)).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const can = p => ME && ME.permissions && ME.permissions.includes(p);
+
+function toast(msg, kind) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.className = "toast show " + (kind || "");
+  setTimeout(() => { t.className = "toast"; }, 2600);
+}
+
+async function api(path, opts = {}) {
+  opts.headers = Object.assign({ "Content-Type": "application/json" }, opts.headers || {});
+  if (TOKEN) opts.headers["Authorization"] = "Bearer " + TOKEN;
+  const r = await fetch(API + path, opts);
+  if (r.status === 401) { logoutLocal(); throw new Error("Session expired"); }
+  let body = null;
+  try { body = await r.json(); } catch (e) {}
+  if (!r.ok) {
+    const msg = body && body.detail ? (typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail)) : ("HTTP " + r.status);
+    throw new Error(msg);
+  }
+  return body;
+}
+
+// ── Auth ──
+async function doLogin() {
+  $("lg-err").textContent = "";
+  const u = $("lg-user").value.trim(), p = $("lg-pass").value;
+  if (!u || !p) { $("lg-err").textContent = "// credentials required"; return; }
+  try {
+    const r = await api("/auth/login", { method: "POST", body: JSON.stringify({ username: u, password: p }) });
+    TOKEN = r.token;
+    sessionStorage.setItem("ds_token", TOKEN);
+    await boot();
+  } catch (e) {
+    $("lg-err").textContent = "// " + (e.message || "authentication failed");
+  }
+}
+
+function logoutLocal() {
+  TOKEN = null; ME = null;
+  sessionStorage.removeItem("ds_token");
+  $("app").style.display = "none";
+  $("login").style.display = "flex";
+}
+
+async function doLogout() {
+  try { await api("/auth/logout", { method: "POST" }); } catch (e) {}
+  logoutLocal();
+}
+
+async function boot() {
+  try { ME = await api("/auth/me"); }
+  catch (e) { logoutLocal(); return; }
+  $("login").style.display = "none";
+  $("app").style.display = "grid";
+  $("who").textContent = ME.username;
+  $("who-role").textContent = ME.role;
+  $("nav-user").textContent = ME.username;
+  $("av").textContent = (ME.username[0] || "?").toUpperCase();
+  if (can("assign_cases")) {
+    try { ASSIGNABLE = (await api("/users/assignable")).users; } catch (e) { ASSIGNABLE = []; }
+  }
+  // Run-scan button + onboarding: only for users who can manage cases
+  if (can("manage_cases")) {
+    $("run-scan-btn").style.display = "inline-flex";
+    $("nav-manage").style.display = "block";
+  }
+  loadAll();
+}
+
+// ── Run scan ──
+async function toggleRunPanel() {
+  const ov = $("run-overlay");
+  const opening = !ov.classList.contains("open");
+  ov.classList.toggle("open");
+  if (opening) {
+    // Always reload the client list fresh — a client onboarded after the panel
+    // was first opened must appear without a page reload.
+    const sel = $("run-client");
+    const current = sel.value;
+    sel.innerHTML = '<option value="">All clients</option>';
+    try {
+      const r = await api("/feed/clients");
+      (r.clients || []).forEach(c => {
+        const o = document.createElement("option");
+        o.value = c.name; o.textContent = `${c.name} (${(c.targets||[]).length} target)`;
+        sel.appendChild(o);
+      });
+      sel.value = current;  // preserve selection if still present
+    } catch (e) { /* leave just "All clients" */ }
+    // Show the variant-intel option only when dnstwist is checked
+    const tw = $("run-twist"), vrow = $("run-vintel-row");
+    tw.onchange = () => { vrow.style.display = tw.checked ? "flex" : "none"; if (!tw.checked) $("run-vintel").checked = false; };
+    vrow.style.display = tw.checked ? "flex" : "none";
+  }
+}
+
+async function launchScan() {
+  const client = $("run-client").value;
+  const scope = $("run-scope").value;
+  const twist = $("run-twist").checked;
+  const vintel = $("run-vintel").checked;
+  const btn = $("run-go");
+  btn.disabled = true;
+  const label = client || "all clients";
+  try {
+    await api("/trigger", { method: "POST", body: JSON.stringify({
+      client: client || null, scope, include_dnstwist: twist, variant_intel: vintel,
+    })});
+    let msg = `scan started — ${label}`;
+    if (scope !== "all") msg += ` (${scope})`;
+    if (twist) msg += vintel ? " + dnstwist + variant intel" : " + dnstwist";
+    toast(msg, "ok");
+    toggleRunPanel();
+    // Poll for fresh cases a few times while the pipeline runs in the background
+    schedulePostScanRefresh(twist || vintel);
+  } catch (e) {
+    toast(e.message, "bad");
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// After launching, refresh summary+cases a few times so results surface
+// without the user hammering the refresh button. Non-blocking.
+function schedulePostScanRefresh(withTwist) {
+  const delays = withTwist ? [60000, 150000, 300000] : [60000, 110000, 150000];
+  delays.forEach(ms => setTimeout(() => { loadSummary(); loadCases(); }, ms));
+}
+
+// ── Onboard client ──
+let OB_DOMAINS = [];  // staged domains: {domain, type}
+const DOMAIN_RE = /^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}$/;
+
+function openOnboard() {
+  OB_DOMAINS = [];
+  ["ob-client","ob-legit","ob-notes","ob-one","ob-bulk"].forEach(id => { if ($(id)) $(id).value = ""; });
+  renderStaged();
+  $("ob-overlay").classList.add("open");
+}
+function closeOnboard() { $("ob-overlay").classList.remove("open"); }
+
+function obStage(dom, type) {
+  dom = (dom || "").trim().toLowerCase();
+  if (!dom) return;
+  if (!DOMAIN_RE.test(dom)) { toast(`invalid domain: ${dom}`, "bad"); return; }
+  if (OB_DOMAINS.some(d => d.domain === dom)) return;  // dedup
+  OB_DOMAINS.push({ domain: dom, type: type === "watchlist" ? "watchlist" : "target" });
+}
+function obAddOne() {
+  obStage($("ob-one").value, $("ob-one-type").value);
+  $("ob-one").value = "";
+  renderStaged();
+}
+function obAddBulk() {
+  const type = $("ob-bulk-type").value;
+  const lines = ($("ob-bulk").value || "").split(/[\n,;]+/);
+  let n = 0;
+  lines.forEach(l => { const before = OB_DOMAINS.length; obStage(l, type); if (OB_DOMAINS.length > before) n++; });
+  $("ob-bulk").value = "";
+  renderStaged();
+  if (n) toast(`${n} domain(s) staged`, "ok");
+}
+function obRemove(i) { OB_DOMAINS.splice(i, 1); renderStaged(); }
+
+function renderStaged() {
+  const el = $("ob-staged");
+  el.innerHTML = OB_DOMAINS.map((d, i) =>
+    `<div class="ob-chip"><span><span class="d">${esc(d.domain)}</span><span class="t ${d.type}">${d.type}</span></span><button class="rm" onclick="obRemove(${i})">&times;</button></div>`
+  ).join("");
+}
+
+async function submitOnboard() {
+  const client = $("ob-client").value.trim();
+  const legit = $("ob-legit").value.trim().toLowerCase();
+  const notes = $("ob-notes").value.trim();
+  if (!client) { toast("client name required", "bad"); return; }
+  if (!/^[a-zA-Z0-9_-]+$/.test(client)) { toast("client: alphanumeric, - and _ only", "bad"); return; }
+  if (!DOMAIN_RE.test(legit)) { toast("valid legitimate domain required", "bad"); return; }
+  if (OB_DOMAINS.length === 0) { toast("add at least one domain", "bad"); return; }
+
+  const btn = $("ob-go"); btn.disabled = true;
+  try {
+    const r = await api("/feed/clients/onboard", { method: "POST", body: JSON.stringify({
+      client, legitimate: legit, notes, domains: OB_DOMAINS,
+    })});
+    let msg = `onboarded ${esc(client)} — ${r.added_count} domain(s)`;
+    if (r.skipped_count) msg += `, ${r.skipped_count} skipped`;
+    toast(msg, "ok");
+    closeOnboard();
+    loadSummary();
+    // Offer to run the first scan straight away
+    if (confirm(`Client "${client}" onboarded with ${r.added_count} domain(s). Run the first scan now?`)) {
+      try {
+        await api("/trigger", { method: "POST", body: JSON.stringify({ client, include_dnstwist: false }) });
+        toast(`scan started — ${esc(client)}`, "ok");
+        schedulePostScanRefresh(false);
+      } catch (e) { toast(e.message, "bad"); }
+    }
+  } catch (e) {
+    toast(e.message, "bad");
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// ── Promote a variant to a monitored target (from the case drawer) ──
+async function promoteDomain(domain, client) {
+  if (!confirm(`Add ${domain} to ${client}'s monitored targets?\n\nIt will be scanned on every run, with its own baseline diff.`)) return;
+  try {
+    await api("/feed/domains/promote", { method: "POST", body: JSON.stringify({ domain, client, type: "target" }) });
+    toast(`${domain} now monitored for ${client}`, "ok");
+  } catch (e) {
+    toast(e.message, "bad");
+  }
+}
+
+// ── Add domain to an existing client (sidebar) ──
+async function openAddDomain() {
+  const sel = $("ad-client");
+  sel.innerHTML = "";
+  try {
+    const r = await api("/feed/clients");
+    (r.clients || []).forEach(c => {
+      const o = document.createElement("option");
+      o.value = c.name; o.textContent = c.name;
+      sel.appendChild(o);
+    });
+  } catch (e) { /* empty */ }
+  $("ad-domain").value = "";
+  $("ad-overlay").classList.add("open");
+}
+function closeAddDomain() { $("ad-overlay").classList.remove("open"); }
+
+async function submitAddDomain() {
+  const client = $("ad-client").value;
+  const domain = $("ad-domain").value.trim().toLowerCase();
+  const type = $("ad-type").value;
+  if (!client) { toast("select a client", "bad"); return; }
+  if (!DOMAIN_RE.test(domain)) { toast("enter a valid domain", "bad"); return; }
+  const btn = $("ad-go"); btn.disabled = true;
+  try {
+    await api("/feed/domains/promote", { method: "POST", body: JSON.stringify({ domain, client, type }) });
+    toast(`${domain} added to ${client}`, "ok");
+    closeAddDomain();
+  } catch (e) {
+    toast(e.message, "bad");
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function setView(v) {
+  VIEW = v;
+  // Switch back to the case view (clients/progress views are separate)
+  $("clients-view").style.display = "none";
+  $("progress-view").style.display = "none";
+  $("case-view").style.display = "";
+  $("nav-clients").classList.remove("active");
+  $("nav-progress").classList.remove("active");
+  stopProgressPolling();
+  document.querySelectorAll(".nav-item").forEach(n => n.classList.toggle("active", n.dataset.view === v));
+  $("crumb-sec").textContent = (v === "overview" ? "Overview" : VIEW_TITLES[v]);
+  $("view-title").textContent = VIEW_TITLES[v] || "Case Queue";
+
+  // Map view → filters
+  const fs = $("f-status"), fv = $("f-sev");
+  fs.value = ""; fv.value = ""; viewAssignee = null;
+  if (v === "new") fs.value = "new";
+  else if (v === "progress") fs.value = "in_progress";
+  else if (v === "critical") fv.value = "CRITICAL";
+  else if (v === "mine") viewAssignee = ME ? ME.id : null;
+  loadCases();
+}
+
+// ── Clients view ──
+async function showClients() {
+  $("case-view").style.display = "none";
+  $("progress-view").style.display = "none";
+  $("clients-view").style.display = "";
+  stopProgressPolling();
+  document.querySelectorAll(".nav-item").forEach(n => n.classList.remove("active"));
+  $("nav-clients").classList.add("active");
+  $("crumb-sec").textContent = "Clients";
+  const grid = $("clients-grid");
+  grid.innerHTML = '<div class="muted">loading…</div>';
+  try {
+    const [cf, sum] = await Promise.all([
+      api("/feed/clients"),
+      api("/summary").catch(() => null),
+    ]);
+    renderClients(cf.clients || [], sum);
+  } catch (e) {
+    grid.innerHTML = `<div class="muted">error: ${esc(e.message)}</div>`;
+  }
+}
+
+function renderClients(clients, summary) {
+  const grid = $("clients-grid");
+  if (!clients.length) {
+    grid.innerHTML = '<div class="empty">// no clients yet — use "Onboard client" to add one</div>';
+    return;
+  }
+  // case counts per client (open cases) if summary exposes them
+  const byClient = (summary && summary.by_client) ? summary.by_client : {};
+  grid.innerHTML = clients.map(c => {
+    const targets = c.targets || [];
+    const watchlist = c.watchlist || [];
+    const openCases = byClient[c.name] != null ? byClient[c.name] : null;
+    const targetRows = targets.length
+      ? targets.map(d => `<div class="cc-dom"><span>${esc(d)}</span><button class="rm" title="Remove from monitoring" onclick="removeDomainFromClient('${esc(d)}','${esc(c.name)}')">&times;</button></div>`).join("")
+      : '<div class="cc-empty">no targets</div>';
+    const watchRows = watchlist.length
+      ? watchlist.map(d => `<div class="cc-dom"><span>${esc(d)}</span><button class="rm" title="Remove from monitoring" onclick="removeDomainFromClient('${esc(d)}','${esc(c.name)}')">&times;</button></div>`).join("")
+      : "";
+    return `<div class="client-card">
+      <div class="cc-head"><span class="cc-name">${esc(c.name)}</span>
+        ${openCases != null ? `<span class="cc-cases"><b>${openCases}</b> open</span>` : ""}</div>
+      <div class="cc-legit">${esc(c.legitimate || "—")}</div>
+      <div class="cc-grp">Targets (${targets.length})</div>
+      ${targetRows}
+      ${watchlist.length ? `<div class="cc-grp">Watchlist (${watchlist.length})</div>${watchRows}` : ""}
+      ${c.notes ? `<div class="cc-note">${esc(c.notes)}</div>` : ""}
+      <div class="cc-actions">
+        <button class="btn btn-sm btn-run" onclick="scanClient('${esc(c.name)}')">▷ Scan</button>
+        <button class="btn btn-sm" onclick="openAddDomainFor('${esc(c.name)}')">+ Add domain</button>
+        <button class="btn btn-sm" onclick="downloadReport('${esc(c.name)}','json')" title="Raw JSON: all collected data">↓ JSON</button>
+        <button class="btn btn-sm" onclick="downloadReport('${esc(c.name)}','html')" title="Readable report">↓ Report</button>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+async function removeDomainFromClient(domain, client) {
+  if (!confirm(`Remove ${domain} from ${client}'s monitored domains?\n\nIt will no longer be scanned. Existing cases are kept.`)) return;
+  try {
+    await api(`/feed/domains/${encodeURIComponent(domain)}?client=${encodeURIComponent(client)}`, { method: "DELETE" });
+    toast(`${domain} removed from ${client}`, "ok");
+    showClients();  // refresh
+  } catch (e) {
+    toast(e.message, "bad");
+  }
+}
+
+// Scan a single client directly from its card (dnstwist off by default here)
+async function scanClient(client) {
+  try {
+    await api("/trigger", { method: "POST", body: JSON.stringify({ client, scope: "all", include_dnstwist: false }) });
+    toast(`scan started — ${client}`, "ok");
+  } catch (e) {
+    toast(e.message, "bad");
+  }
+}
+
+// Open the Add-domain panel pre-selected to a client
+async function openAddDomainFor(client) {
+  await openAddDomain();
+  $("ad-client").value = client;
+}
+
+// ── Scan progress view (polls /progress for real pipeline state) ──
+let PROG_TIMER = null;
+
+function showProgress() {
+  $("case-view").style.display = "none";
+  $("clients-view").style.display = "none";
+  $("progress-view").style.display = "";
+  document.querySelectorAll(".nav-item").forEach(n => n.classList.remove("active"));
+  $("nav-progress").classList.add("active");
+  $("crumb-sec").textContent = "Scan progress";
+  pollProgress();
+  if (PROG_TIMER) clearInterval(PROG_TIMER);
+  PROG_TIMER = setInterval(pollProgress, 2500);
+}
+
+function stopProgressPolling() {
+  if (PROG_TIMER) { clearInterval(PROG_TIMER); PROG_TIMER = null; }
+}
+
+async function pollProgress() {
+  // Only poll while the progress view is visible
+  if ($("progress-view").style.display === "none") { stopProgressPolling(); return; }
+  let p;
+  try { p = await api("/progress"); }
+  catch (e) { return; }
+
+  const phase = p.phase || "idle";
+  const ph = $("prog-phase");
+  ph.textContent = phase;
+  ph.className = "prog-phase " + phase;
+  $("prog-client").textContent = p.client && p.client !== "all" ? p.client : (p.client === "all" ? "all clients" : "");
+  $("prog-fill").style.width = (p.percent || 0) + "%";
+  $("prog-counts").textContent = p.total ? `${p.done}/${p.total} domains · ${p.percent}%` : (phase === "done" ? "complete" : "—");
+  $("prog-current").textContent = p.current_domain ? `▸ ${p.current_domain}` : "";
+
+  const log = $("prog-log");
+  if (p.log && p.log.length) {
+    log.innerHTML = p.log.map(l =>
+      `<div class="ln"><span class="t">${esc((l.ts||"").slice(11,19))}</span>${esc(l.msg)}</div>`
+    ).join("");
+    log.scrollTop = log.scrollHeight;
+  } else {
+    log.innerHTML = '<div class="muted">no active scan</div>';
+  }
+
+  // When a run finishes, refresh the case counts in the background
+  if (phase === "done" && p.events) { loadSummary(); }
+}
+
+// ── Client report (raw JSON + readable HTML) ──
+// Assembles everything collected for a client: feed config, all cases, and the
+// intel snapshot of every domain that has one. Built client-side from existing
+// endpoints — reflects exactly what the dashboard can see.
+async function gatherClientReport(client) {
+  // 1. feed config for this client
+  let cfg = null;
+  try {
+    const cf = await api("/feed/clients");
+    cfg = (cf.clients || []).find(c => c.name === client) || { name: client };
+  } catch (e) { cfg = { name: client }; }
+
+  // 2. all cases for this client
+  let cases = [];
+  try {
+    const r = await api(`/cases?client=${encodeURIComponent(client)}&limit=500`);
+    cases = r.cases || [];
+  } catch (e) { /* leave empty */ }
+
+  // 3. intel snapshot for every domain we know about (targets + watchlist + case domains)
+  const domains = new Set([...(cfg.targets || []), ...(cfg.watchlist || []), ...cases.map(c => c.domain)]);
+  const intel = {};
+  await Promise.all([...domains].map(async d => {
+    try {
+      const r = await api(`/intel?client=${encodeURIComponent(client)}&domain=${encodeURIComponent(d)}`);
+      if (r && r.snapshot) intel[d] = r;
+    } catch (e) { /* no snapshot for this domain */ }
+  }));
+
+  return {
+    report_generated: new Date().toISOString(),
+    client: cfg.name,
+    legitimate: cfg.legitimate || null,
+    notes: cfg.notes || "",
+    targets: cfg.targets || [],
+    watchlist: cfg.watchlist || [],
+    case_count: cases.length,
+    cases,
+    intel_snapshots: intel,
+  };
+}
+
+function triggerDownload(filename, text, mime) {
+  const blob = new Blob([text], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+async function downloadReport(client, fmt) {
+  toast(`building ${fmt.toUpperCase()} report for ${client}…`, "ok");
+  let data;
+  try { data = await gatherClientReport(client); }
+  catch (e) { toast(`report failed: ${e.message}`, "bad"); return; }
+
+  const stamp = new Date().toISOString().slice(0, 10);
+  if (fmt === "json") {
+    triggerDownload(`domainsentry_${client}_${stamp}.json`, JSON.stringify(data, null, 2), "application/json");
+  } else {
+    triggerDownload(`domainsentry_${client}_${stamp}.html`, buildHtmlReport(data), "text/html");
+  }
+}
+
+function buildHtmlReport(d) {
+  const e = s => String(s == null ? "" : s).replace(/[&<>"']/g, m => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m]));
+  const sev = c => (c.severity || "—");
+  const caseRows = (d.cases || []).map(c => `<tr>
+    <td class="m">${e(c.domain)}</td><td>${e(c.classification || "—")}</td>
+    <td>${e(sev(c))}</td><td>${e(c.status)}</td></tr>`).join("") ||
+    `<tr><td colspan="4" class="muted">no cases</td></tr>`;
+
+  // Per-domain intel: surface the signals that matter for triage
+  const intelBlocks = Object.entries(d.intel_snapshots || {}).map(([dom, r]) => {
+    const i = (r.snapshot && r.snapshot.intel) || {};
+    const dns = (i.dns || {}).records || {};
+    const http = i.http || {};
+    const cert = (i.cert || {}).ct_certificates || {};
+    const a = dns.A ? "yes" : "no", mx = dns.MX ? "yes" : "no";
+    const site = http.overall_status === "active" ? "active" : "no";
+    return `<div class="dom">
+      <div class="dom-h">${e(dom)}</div>
+      <table class="kv">
+        <tr><td>A record</td><td>${a}</td></tr>
+        <tr><td>MX (email)</td><td class="${mx==='yes'?'flag':''}">${mx}</td></tr>
+        <tr><td>Website</td><td class="${site==='active'?'flag':''}">${site}</td></tr>
+        <tr><td>Certificates</td><td>${cert.total || 0}</td></tr>
+      </table>
+    </div>`;
+  }).join("") || `<p class="muted">No intel snapshots collected yet. Run a scan with "collect variant intel" to populate.</p>`;
+
+  return `<!doctype html><html><head><meta charset="utf-8">
+<title>DomainSentry report — ${e(d.client)}</title>
+<style>
+  body { font: 14px/1.55 -apple-system, system-ui, sans-serif; color: #1a2332; max-width: 880px; margin: 40px auto; padding: 0 24px; }
+  h1 { font-size: 22px; margin-bottom: 2px; } h2 { font-size: 15px; margin-top: 30px; border-bottom: 1px solid #e0e6ed; padding-bottom: 6px; }
+  .sub { color: #6b7280; font-size: 13px; } .legit { font-family: ui-monospace, monospace; color: #0b6; }
+  table { border-collapse: collapse; width: 100%; margin-top: 10px; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #eef1f5; }
+  th { color: #6b7280; font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+  .m { font-family: ui-monospace, monospace; } .muted { color: #9aa5b1; } .flag { color: #c0392b; font-weight: 600; }
+  .note { background: #f7f9fb; border-left: 3px solid #cbd5e0; padding: 10px 14px; margin-top: 10px; font-size: 13px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px,1fr)); gap: 12px; margin-top: 10px; }
+  .dom { border: 1px solid #e0e6ed; border-radius: 6px; padding: 12px; } .dom-h { font-family: ui-monospace, monospace; font-weight: 600; margin-bottom: 6px; }
+  .kv td { border: none; padding: 2px 0; } .kv td:first-child { color: #6b7280; width: 55%; }
+  .foot { margin-top: 40px; color: #9aa5b1; font-size: 11px; border-top: 1px solid #eef1f5; padding-top: 12px; }
+</style></head><body>
+<h1>DomainSentry — ${e(d.client)}</h1>
+<div class="sub">Domain intelligence report · generated ${e(d.report_generated.slice(0,16).replace("T"," "))} UTC</div>
+<div class="legit">legitimate: ${e(d.legitimate || "—")}</div>
+${d.notes ? `<div class="note">${e(d.notes)}</div>` : ""}
+
+<h2>Monitored domains</h2>
+<p class="sub">${(d.targets||[]).length} target · ${(d.watchlist||[]).length} watchlist</p>
+<table><tr><th>Domain</th><th>Type</th></tr>
+${[...(d.targets||[]).map(t=>`<tr><td class="m">${e(t)}</td><td>target</td></tr>`),
+   ...(d.watchlist||[]).map(w=>`<tr><td class="m">${e(w)}</td><td>watchlist</td></tr>`)].join("") || '<tr><td colspan="2" class="muted">none</td></tr>'}
+</table>
+
+<h2>Cases (${d.case_count})</h2>
+<table><tr><th>Domain</th><th>Classification</th><th>Severity</th><th>Status</th></tr>${caseRows}</table>
+
+<h2>Collected intelligence</h2>
+<div class="grid">${intelBlocks}</div>
+
+<div class="foot">Generated by DomainSentry. Raw data available in the JSON export. dnstwist variants require manual OSINT verification before escalation — discovery is a signal, not a verdict.</div>
+</body></html>`;
+}
+
+// ── Summary + cases ──
+async function loadAll() { await Promise.all([loadSummary(), loadCases()]); }
+
+async function loadSummary() {
+  try {
+    const s = await api("/summary");
+    const open = (s.by_status.new || 0) + (s.by_status.in_progress || 0);
+    const crit = s.open_by_severity.CRITICAL || 0;
+    const high = s.open_by_severity.HIGH || 0;
+    const cards = [
+      { n: open, l: "Open cases", cls: "ok" },
+      { n: s.new_unassigned || 0, l: "Unassigned", cls: (s.new_unassigned || 0) > 0 ? "warn" : "" },
+      { n: crit, l: "Critical", cls: crit > 0 ? "alert" : "" },
+      { n: high, l: "High", cls: "" },
+      { n: s.updated_last_24h || 0, l: "Updated · 24h", cls: "" },
+    ];
+    $("cards").innerHTML = cards.map(c =>
+      `<div class="card ${c.cls}"><div class="n">${c.n}</div><div class="l">${c.l}</div></div>`
+    ).join("");
+    // sidebar counts
+    $("c-all").textContent = (s.by_status.new||0)+(s.by_status.in_progress||0)+(s.by_status.closed_tp||0)+(s.by_status.closed_fp||0)+(s.by_status.closed_benign||0);
+    $("c-new").textContent = s.by_status.new || 0;
+    $("c-prog").textContent = s.by_status.in_progress || 0;
+    $("c-crit").textContent = crit;
+  } catch (e) { toast(e.message, "bad"); }
+}
+
+let debTimer = null;
+function debouncedCases() { clearTimeout(debTimer); debTimer = setTimeout(loadCases, 300); }
+
+async function loadCases() {
+  const params = new URLSearchParams();
+  const st = $("f-status").value, sv = $("f-sev").value, cl = $("f-client").value.trim();
+  const grouped = $("f-group") && $("f-group").checked;
+  if (st) params.set("status", st);
+  if (sv) params.set("severity", sv);
+  if (cl) params.set("client", cl);
+  if (viewAssignee != null) params.set("assignee", viewAssignee);
+  // When grouping, pull the full set so every client's cases are present
+  params.set("limit", grouped ? "1000" : "200");
+  try {
+    const r = await api("/cases?" + params.toString());
+    if (grouped) renderGrouped(r.cases);
+    else renderRows(r.cases);
+    if (VIEW === "mine") $("c-mine").textContent = r.count;
+  } catch (e) { toast(e.message, "bad"); }
+}
+
+function fmtDate(s) {
+  if (!s) return "—";
+  const d = new Date(s);
+  if (isNaN(d)) return "—";
+  return d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+
+function sevBadge(s) { return s ? `<span class="badge sev-${esc(s)}">${esc(s)}</span>` : '<span class="muted">—</span>'; }
+function stBadge(s) {
+  const labels = { new: "New", in_progress: "In progress", closed_tp: "True Positive", closed_fp: "False Positive", closed_benign: "Benign" };
+  return `<span class="badge st-${esc(s)}">${esc(labels[s] || s)}</span>`;
+}
+
+function rowHtml(c) {
+  return `
+    <tr onclick="openCase(${c.id})">
+      <td class="domain">${esc(c.domain)}</td>
+      <td class="muted">${esc(c.client)}</td>
+      <td>${esc(c.classification || "—")}</td>
+      <td>${sevBadge(c.severity)}</td>
+      <td>${stBadge(c.status)}</td>
+      <td class="muted">${esc(c.assignee_name || "—")}</td>
+      <td class="muted">${fmtDate(c.updated_at)}</td>
+    </tr>`;
+}
+
+function renderRows(cases) {
+  const tb = $("rows");
+  if (!cases || cases.length === 0) { tb.innerHTML = ""; $("empty").style.display = "block"; return; }
+  $("empty").style.display = "none";
+  tb.innerHTML = cases.map(rowHtml).join("");
+}
+
+// Collapsed-group memory so toggling a client stays put across refreshes
+const COLLAPSED_CLIENTS = new Set();
+function toggleClientGroup(name) {
+  if (COLLAPSED_CLIENTS.has(name)) COLLAPSED_CLIENTS.delete(name);
+  else COLLAPSED_CLIENTS.add(name);
+  loadCases();
+}
+
+const SEV_RANK = { CRITICAL: 4, HIGH: 3, MEDIUM: 2, LOW: 1 };
+
+function renderGrouped(cases) {
+  const tb = $("rows");
+  if (!cases || cases.length === 0) { tb.innerHTML = ""; $("empty").style.display = "block"; return; }
+  $("empty").style.display = "none";
+
+  // group by client
+  const groups = {};
+  cases.forEach(c => { (groups[c.client] = groups[c.client] || []).push(c); });
+
+  // sort clients: highest max-severity first, then by case count
+  const clientNames = Object.keys(groups).sort((a, b) => {
+    const maxA = Math.max(...groups[a].map(c => SEV_RANK[c.severity] || 0));
+    const maxB = Math.max(...groups[b].map(c => SEV_RANK[c.severity] || 0));
+    if (maxB !== maxA) return maxB - maxA;
+    return groups[b].length - groups[a].length;
+  });
+
+  let html = "";
+  for (const name of clientNames) {
+    const rows = groups[name];
+    // per-client severity tally
+    const tally = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0 };
+    rows.forEach(c => { if (tally[c.severity] != null) tally[c.severity]++; });
+    const collapsed = COLLAPSED_CLIENTS.has(name);
+    const dots = ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
+      .filter(s => tally[s] > 0)
+      .map(s => `<span class="gsev sev-${s}">${tally[s]} ${s.toLowerCase()}</span>`).join("");
+    html += `<tr class="group-head" onclick="toggleClientGroup('${esc(name)}')">
+      <td colspan="7">
+        <span class="gcaret">${collapsed ? "▸" : "▾"}</span>
+        <span class="gname">${esc(name)}</span>
+        <span class="gcount">${rows.length} case${rows.length !== 1 ? "s" : ""}</span>
+        <span class="gdots">${dots}</span>
+      </td></tr>`;
+    if (!collapsed) {
+      // within a client, sort by severity desc then newest
+      rows.sort((a, b) => (SEV_RANK[b.severity] || 0) - (SEV_RANK[a.severity] || 0)
+                          || (b.updated_at || "").localeCompare(a.updated_at || ""));
+      html += rows.map(rowHtml).join("");
+    }
+  }
+  tb.innerHTML = html;
+}
+
+// ── Case drawer ──
+let CURRENT_INTEL = null;
+
+async function openCase(id) {
+  try {
+    const d = await api("/cases/" + id);
+    CURRENT = d.case;
+    // Also fetch full intelligence (snapshot + diff history) for this domain.
+    // Non-fatal: if the intel store is disabled or empty, the tab shows a notice.
+    CURRENT_INTEL = null;
+    try {
+      CURRENT_INTEL = await api(`/intel?client=${encodeURIComponent(d.case.client)}&domain=${encodeURIComponent(d.case.domain)}`);
+    } catch (e) { CURRENT_INTEL = null; }
+    renderDrawer(d);
+    $("overlay").classList.add("open");
+    $("drawer").classList.add("open");
+  } catch (e) { toast(e.message, "bad"); }
+}
+
+function closeDrawer() {
+  $("overlay").classList.remove("open");
+  $("drawer").classList.remove("open");
+  CURRENT = null;
+}
+
+function renderDrawer(d) {
+  const c = d.case;
+  const isClosed = c.status.startsWith("closed_");
+
+  let actions = "";
+  if (!isClosed && (can("manage_cases") || can("assign_cases") || can("whitelist") || can("add_notes"))) {
+    actions += '<div class="block-title">Actions</div>';
+    if (can("assign_cases")) {
+      const opts = ASSIGNABLE.map(u => `<option value="${u.id}" ${c.assignee_id === u.id ? "selected" : ""}>${esc(u.username)}</option>`).join("");
+      actions += `<div class="action-row">
+        <select id="a-assignee"><option value="">— unassigned —</option>${opts}</select>
+        <button class="btn btn-sm" onclick="doAssign(${c.id})">Assign</button>
+        <button class="btn btn-sm" onclick="takeCase(${c.id})">Take</button>
+      </div>`;
+    }
+    if (can("manage_cases")) {
+      actions += `<div class="action-row">
+        <select id="a-status">
+          <option value="new" ${c.status==='new'?'selected':''}>New</option>
+          <option value="in_progress" ${c.status==='in_progress'?'selected':''}>In progress</option>
+          <option value="closed_tp">Close — True Positive</option>
+          <option value="closed_fp">Close — False Positive</option>
+          <option value="closed_benign">Close — Benign</option>
+        </select>
+        <button class="btn btn-sm" onclick="doStatus(${c.id})">Update</button>
+      </div>`;
+    }
+    if (can("whitelist")) {
+      actions += `<div class="action-row">
+        <input id="a-wl" type="text" placeholder="whitelist reason (verified legit)…">
+        <button class="btn btn-sm btn-danger" onclick="doWhitelist(${c.id})">Whitelist + close FP</button>
+      </div>`;
+    }
+    if (can("manage_cases")) {
+      actions += `<div class="action-row">
+        <button class="btn btn-sm btn-promote" onclick="promoteDomain('${esc(c.domain)}','${esc(c.client)}')" title="Add this domain to the client's monitored targets">↑ Promote to monitored target</button>
+      </div>`;
+    }
+    if (can("add_notes")) {
+      actions += `<textarea class="note-in" id="a-note" placeholder="add a note…"></textarea>
+        <button class="btn btn-sm" onclick="doNote(${c.id})">Add note</button>`;
+    }
+  } else if (isClosed && can("manage_cases")) {
+    // Closed cases are not a dead end: allow reopening (e.g. an FP later found
+    // to be a real threat after OSINT, or a mistaken close).
+    actions += '<div class="block-title">Actions</div>';
+    actions += `<div class="action-row">
+      <button class="btn btn-sm" onclick="reopenCase(${c.id})" title="Reopen this case for further review">↺ Reopen case</button>
+    </div>`;
+    if (can("add_notes")) {
+      actions += `<textarea class="note-in" id="a-note" placeholder="add a note…"></textarea>
+        <button class="btn btn-sm" onclick="doNote(${c.id})">Add note</button>`;
+    }
+  }
+
+  const notes = (d.notes || []).map(n =>
+    `<div class="note">${esc(n.note)}<div class="meta">${esc(n.username)} · ${fmtDate(n.created_at)}</div></div>`
+  ).join("") || '<div class="muted" style="font-size:13px">// no notes</div>';
+
+  const hist = (d.history || []).map(h =>
+    `<div class="hist">${esc(h.action)}${h.detail ? " — " + esc(h.detail) : ""}<div class="meta">${esc(h.username || "system")} · ${fmtDate(h.timestamp)}</div></div>`
+  ).join("") || '<div class="muted" style="font-size:13px">// no history</div>';
+
+  const overviewTab = `
+      <dl class="kv">
+        <dt>Client</dt><dd>${esc(c.client)}</dd>
+        <dt>Classification</dt><dd>${esc(c.classification || "—")}</dd>
+        <dt>Confidence</dt><dd>${esc(c.confidence || "—")}</dd>
+        <dt>Assignee</dt><dd>${esc(c.assignee_name || "unassigned")}</dd>
+        <dt>Created</dt><dd>${fmtDate(c.created_at)}</dd>
+        <dt>Updated</dt><dd>${fmtDate(c.updated_at)}</dd>
+      </dl>
+      ${c.rationale ? `<div class="rationale">${esc(c.rationale)}</div>` : ""}
+      ${actions}
+      <div class="block-title">Notes</div>
+      ${notes}
+      <div class="block-title">History</div>
+      ${hist}`;
+
+  $("drawer").innerHTML = `
+    <div class="drawer-head">
+      <div>
+        <div class="domain" style="font-size:16px">${esc(c.domain)}</div>
+        <div style="margin-top:8px">${sevBadge(c.severity)} ${stBadge(c.status)}</div>
+      </div>
+      <button class="x" onclick="closeDrawer()">&times;</button>
+    </div>
+    <div class="tabs">
+      <button class="tab active" data-tab="overview" onclick="switchTab('overview')">Overview</button>
+      <button class="tab" data-tab="intel" onclick="switchTab('intel')">Intelligence</button>
+      <button class="tab" data-tab="raw" onclick="switchTab('raw')">Raw JSON</button>
+    </div>
+    <div class="drawer-body">
+      <div class="tab-pane active" id="pane-overview">${overviewTab}</div>
+      <div class="tab-pane" id="pane-intel">${renderIntelTab()}</div>
+      <div class="tab-pane" id="pane-raw">${renderRawTab()}</div>
+    </div>`;
+}
+
+function switchTab(name) {
+  document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t.dataset.tab === name));
+  document.querySelectorAll(".tab-pane").forEach(p => p.classList.toggle("active", p.id === "pane-" + name));
+}
+
+function flag(v) {
+  return v
+    ? '<span class="flag-yes">● yes</span>'
+    : '<span class="flag-no">○ no</span>';
+}
+
+function renderIntelTab() {
+  if (!CURRENT_INTEL || !CURRENT_INTEL.available || !CURRENT_INTEL.snapshot) {
+    return '<div class="muted" style="font-size:13px;padding:8px 0">// no intelligence stored for this domain<br><br>Enable <code>INTEL_STORE=true</code> and re-run a scan to populate DNS records, certificates, HTTP fingerprint and baseline diff history.</div>';
+  }
+  const intel = CURRENT_INTEL.snapshot.intel || {};
+  const dns = (intel.dns || {});
+  const records = dns.records || {};
+  const http = intel.http || {};
+  const cert = intel.cert || {};
+  const whois = intel.whois || {};
+  const rep = intel.reputation || {};
+
+  // DNS records table
+  let dnsRows = "";
+  ["A", "AAAA", "MX", "NS", "TXT", "SOA", "CNAME"].forEach(t => {
+    const v = records[t];
+    if (v && (Array.isArray(v) ? v.length : true)) {
+      const val = Array.isArray(v) ? v.join("<br>") : esc(String(v));
+      dnsRows += `<tr><td class="ik">${t}</td><td class="iv mono">${esc(Array.isArray(v) ? v.join(" · ") : String(v))}</td></tr>`;
+    }
+  });
+  // email auth
+  const ea = dns.email_auth || {};
+  if (ea.spf) dnsRows += `<tr><td class="ik">SPF</td><td class="iv mono">${esc(String(ea.spf).slice(0,200))}</td></tr>`;
+  if (ea.dmarc) dnsRows += `<tr><td class="ik">DMARC</td><td class="iv mono">${esc(String(ea.dmarc).slice(0,200))}</td></tr>`;
+  if (ea.dkim && ea.dkim.selectors_found && ea.dkim.selectors_found.length)
+    dnsRows += `<tr><td class="ik">DKIM</td><td class="iv mono">${esc(ea.dkim.selectors_found.join(", "))}</td></tr>`;
+  if (!dnsRows) dnsRows = '<tr><td colspan="2" class="muted">no DNS records</td></tr>';
+
+  // subdomains
+  const subs = (dns.subdomains && dns.subdomains.active) || [];
+  let subBlock = "";
+  if (subs.length) {
+    subBlock = `<div class="block-title">Subdomains (${subs.length})</div><table class="itable">` +
+      subs.map(s => `<tr><td class="ik mono">${esc(s.fqdn || "")}</td><td class="iv mono">${esc((s.A||[]).join(", ") || (s.CNAME||[]).join(", "))}</td></tr>`).join("") +
+      `</table>`;
+  }
+
+  // HTTP checks
+  const checks = http.checks || [];
+  let httpBlock = "";
+  if (checks.length) {
+    httpBlock = checks.map(ch => {
+      const he = ch.hidden_elements;
+      let hiddenRow = "";
+      if (he && he.risk_indicators) {
+        const pixels = he.tracking_pixels || [];
+        const ext = he.external_resources || [];
+        const summary = (he.summary || []).join(", ");
+        let detail = "";
+        if (summary) detail += `<div class="he-sum">${esc(summary)}</div>`;
+        if (pixels.length) {
+          detail += `<div class="he-grp">Tracking pixels (${pixels.length})</div>` +
+            pixels.map(p => `<div class="he-item">${esc(p.src || (typeof p === "string" ? p : JSON.stringify(p)))}</div>`).join("");
+        }
+        if (ext.length) {
+          detail += `<div class="he-grp">External resources (${ext.length})</div>` +
+            ext.slice(0, 40).map(u => `<div class="he-item">${esc(u)}</div>`).join("") +
+            (ext.length > 40 ? `<div class="he-item muted">… +${ext.length - 40} more</div>` : "");
+        }
+        hiddenRow = `<tr><td class="ik">Hidden risk</td><td class="iv">
+          <span style="color:var(--high)">${he.risk_indicators} indicator(s)</span>
+          <details class="he-details"><summary>show details</summary>${detail || '<div class="he-item muted">no breakdown available</div>'}</details>
+        </td></tr>`;
+      }
+      return `
+      <table class="itable">
+        <tr><td class="ik">URL</td><td class="iv mono">${esc(ch.url || "")}</td></tr>
+        <tr><td class="ik">Status</td><td class="iv">${ch.status_code || "—"}</td></tr>
+        <tr><td class="ik">Server</td><td class="iv mono">${esc(ch.server || "—")}</td></tr>
+        <tr><td class="ik">Title</td><td class="iv">${esc(ch.title || "—")}</td></tr>
+        <tr><td class="ik">Length</td><td class="iv">${ch.content_length || 0} b</td></tr>
+        ${hiddenRow}
+      </table>`;
+    }).join("");
+  } else {
+    httpBlock = '<div class="muted">no active HTTP response</div>';
+  }
+
+  // Certificates
+  const ct = cert.ct_certificates || {};
+  const certList = ct.recent || ct.certificates || [];
+  let certBlock = `<div class="muted">total: ${ct.total || 0}</div>`;
+  if (Array.isArray(certList) && certList.length) {
+    certBlock += `<table class="itable"><tr><th>Issuer</th><th>Common name</th><th>Seen</th></tr>` +
+      certList.slice(0, 30).map(cc => `<tr><td class="mono">${esc(cc.issuer_name || cc.issuer || "—")}</td><td class="mono">${esc(cc.common_name || cc.name_value || "—")}</td><td class="mono">${esc(cc.entry_timestamp || cc.not_before || "—")}</td></tr>`).join("") +
+      `</table>`;
+  }
+
+  // WHOIS
+  let whoisRows = "";
+  [["Registrar","registrar"],["Created","creation_date"],["Expires","expiration_date"],["Age (days)","age_days"]].forEach(([l,k]) => {
+    if (whois[k] != null) whoisRows += `<tr><td class="ik">${l}</td><td class="iv mono">${esc(String(whois[k]))}</td></tr>`;
+  });
+  if (whois.registrant && whois.registrant.country) whoisRows += `<tr><td class="ik">Country</td><td class="iv mono">${esc(whois.registrant.country)}</td></tr>`;
+
+  // baseline diff history
+  const hist = (CURRENT_INTEL.history || []);
+  let histBlock = "";
+  if (hist.length) {
+    histBlock = hist.map(h => `
+      <div class="diff-entry">
+        <div class="diff-head"><span class="badge sev-${esc(h.max_severity)}">${esc(h.max_severity)}</span> <span class="muted">${fmtDate(h.timestamp)} · ${h.alert_count} change(s)</span></div>
+        ${(h.alerts||[]).map(a => `<div class="diff-alert">▸ ${esc(a.type || "")} ${a.detail ? "— " + esc(String(a.detail).slice(0,200)) : ""}</div>`).join("")}
+      </div>`).join("");
+  } else {
+    histBlock = '<div class="muted">// no changes recorded yet — diff history appears after the second scan</div>';
+  }
+
+  return `
+    <div class="intel-search"><input id="intel-filter" placeholder="filter intelligence…" oninput="filterIntel()"></div>
+    <div class="intel-sec" data-sec="dns"><div class="block-title">DNS records</div><table class="itable">${dnsRows}</table>${subBlock}</div>
+    <div class="intel-sec" data-sec="http"><div class="block-title">HTTP fingerprint</div>${httpBlock}</div>
+    <div class="intel-sec" data-sec="certificates"><div class="block-title">Certificates</div>${certBlock}</div>
+    <div class="intel-sec" data-sec="whois"><div class="block-title">WHOIS</div><table class="itable">${whoisRows || '<tr><td colspan="2" class="muted">no WHOIS data</td></tr>'}</table></div>
+    <div class="intel-sec" data-sec="reputation"><div class="block-title">Reputation</div><table class="itable"><tr><td class="ik">Score</td><td class="iv">${rep.risk_score != null ? rep.risk_score : "—"}</td></tr><tr><td class="ik">Level</td><td class="iv">${esc(rep.risk_level || "—")}</td></tr></table></div>
+    <div class="intel-sec" data-sec="baseline diff history"><div class="block-title">Baseline diff history</div>${histBlock}</div>`;
+}
+
+function filterIntel() {
+  const q = ($("intel-filter").value || "").toLowerCase();
+  document.querySelectorAll("#pane-intel .intel-sec").forEach(sec => {
+    const txt = (sec.dataset.sec + " " + sec.textContent).toLowerCase();
+    sec.style.display = txt.includes(q) ? "" : "none";
+  });
+}
+
+function renderRawTab() {
+  const data = CURRENT_INTEL && CURRENT_INTEL.snapshot ? CURRENT_INTEL.snapshot : { note: "no intelligence snapshot stored" };
+  const json = JSON.stringify(data, null, 2);
+  return `
+    <div class="raw-toolbar"><button class="btn btn-sm" onclick="copyRaw()">⧉ Copy JSON</button></div>
+    <pre class="raw-json" id="raw-json">${esc(json)}</pre>`;
+}
+
+function copyRaw() {
+  const el = $("raw-json");
+  if (!el) return;
+  const text = el.textContent;
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(() => toast("JSON copied", "ok"), () => fallbackCopy(text));
+  } else { fallbackCopy(text); }
+}
+function fallbackCopy(text) {
+  const ta = document.createElement("textarea");
+  ta.value = text; document.body.appendChild(ta); ta.select();
+  try { document.execCommand("copy"); toast("JSON copied", "ok"); } catch (e) { toast("copy failed", "bad"); }
+  document.body.removeChild(ta);
+}
+
+// ── Actions ──
+async function refreshAfter(id) { await loadSummary(); await loadCases(); if (id) await openCase(id); }
+
+async function doAssign(id) {
+  const v = $("a-assignee").value;
+  try {
+    await api(`/cases/${id}/assign`, { method: "POST", body: JSON.stringify({ assignee_id: v ? parseInt(v) : null }) });
+    toast("assignment updated", "ok"); refreshAfter(id);
+  } catch (e) { toast(e.message, "bad"); }
+}
+async function takeCase(id) {
+  if (!ME) return;
+  try {
+    await api(`/cases/${id}/assign`, { method: "POST", body: JSON.stringify({ assignee_id: ME.id }) });
+    toast("case assigned to you", "ok"); refreshAfter(id);
+  } catch (e) { toast(e.message, "bad"); }
+}
+async function doStatus(id) {
+  const v = $("a-status").value;
+  try {
+    await api(`/cases/${id}/status`, { method: "PATCH", body: JSON.stringify({ status: v }) });
+    toast("status updated", "ok"); refreshAfter(id);
+  } catch (e) { toast(e.message, "bad"); }
+}
+async function reopenCase(id) {
+  try {
+    await api(`/cases/${id}/status`, { method: "PATCH", body: JSON.stringify({ status: "in_progress" }) });
+    toast("case reopened (in progress)", "ok"); refreshAfter(id);
+  } catch (e) { toast(e.message, "bad"); }
+}
+async function doNote(id) {
+  const v = $("a-note").value.trim();
+  if (!v) { toast("note is empty", "bad"); return; }
+  try {
+    await api(`/cases/${id}/notes`, { method: "POST", body: JSON.stringify({ note: v }) });
+    toast("note added", "ok"); refreshAfter(id);
+  } catch (e) { toast(e.message, "bad"); }
+}
+async function doWhitelist(id) {
+  const v = $("a-wl").value.trim();
+  if (!v) { toast("enter a whitelist reason", "bad"); return; }
+  if (!confirm("Whitelist this domain and close the case as False Positive?")) return;
+  try {
+    await api(`/cases/${id}/whitelist`, { method: "POST", body: JSON.stringify({ reason: v }) });
+    toast("whitelisted and closed", "ok"); refreshAfter(id);
+  } catch (e) { toast(e.message, "bad"); }
+}
+
+// ── Init ──
+$("lg-pass").addEventListener("keydown", e => { if (e.key === "Enter") doLogin(); });
+document.addEventListener("keydown", e => { if (e.key === "Escape") closeDrawer(); });
+if (TOKEN) boot();
+</script>
+</body>
+</html>

@@ -17,6 +17,7 @@ logger = logging.getLogger("cert-intel")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [CERT] %(message)s")
 
 CRTSH_TIMEOUT = int(os.environ.get("CRTSH_TIMEOUT", "30"))
+MAX_CRTSH_BYTES = int(os.environ.get("MAX_CRTSH_BYTES", str(10 * 1024 * 1024)))  # 10MB
 
 
 @app.get("/health")
@@ -45,7 +46,12 @@ def cert_check(
         url = f"https://crt.sh/?q={query}&output=json"
         resp = http_get_with_retry(url, timeout=CRTSH_TIMEOUT, verify_ssl=True, max_attempts=2)
         if resp["status_code"] == 200 and resp["content"]:
-            certs = json.loads(resp["content"])
+            # Cap response size: cert-heavy domains can return many MB
+            content = resp["content"]
+            if len(content) > MAX_CRTSH_BYTES:
+                result["error"] = f"crt.sh response too large ({len(content)} bytes), truncated analysis"
+                content = None
+            certs = json.loads(content) if content else []
             unique_cn = set()
             san_subs = set()
             cert_list = []

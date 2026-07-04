@@ -3,7 +3,7 @@ WHOIS Intelligence Service (:8004)
 Modulo 8 estratto — WHOIS lookup con parsing strutturato.
 """
 
-import os, logging, subprocess, re, time
+import os, logging, subprocess, re, time, threading
 from datetime import datetime, timezone
 from fastapi import FastAPI, APIRouter, Query
 from fastapi.responses import JSONResponse
@@ -18,13 +18,17 @@ logger = logging.getLogger("whois-intel")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [WHOIS] %(message)s")
 
 WHOIS_TIMEOUT = int(os.environ.get("WHOIS_TIMEOUT", "10"))
-WHOIS_DELAY = int(os.environ.get("WHOIS_DELAY", "2"))
+WHOIS_DELAY = float(os.environ.get("WHOIS_DELAY", "2"))
 
 # Simple LRU cache with max size
 _cache = {}
 _cache_order = []
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "86400"))
 CACHE_MAX_SIZE = int(os.environ.get("CACHE_MAX_SIZE", "500"))
+
+# Rate limiting via timestamp (non-blocking between distinct domains)
+_last_query_time = 0.0
+_rate_lock = threading.Lock()
 
 try:
     import whois as whois_lib
@@ -57,6 +61,14 @@ def whois_check(domain: str = Query(..., min_length=4, max_length=253, pattern=r
         "privacy_protected": False, "dnssec": False,
         "age_days": None, "error": None
     }
+
+    # Rate limiting: only wait the remaining time since last real query
+    global _last_query_time
+    with _rate_lock:
+        elapsed = time.time() - _last_query_time
+        if elapsed < WHOIS_DELAY:
+            time.sleep(WHOIS_DELAY - elapsed)
+        _last_query_time = time.time()
 
     try:
         if HAS_WHOIS_LIB:
@@ -104,7 +116,6 @@ def whois_check(domain: str = Query(..., min_length=4, max_length=253, pattern=r
         _cache_order.remove(domain)
     _cache_order.append(domain)
 
-    time.sleep(WHOIS_DELAY)  # rate limiting
     return JSONResponse(content=result)
 
 

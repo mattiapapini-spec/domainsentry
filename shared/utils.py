@@ -168,12 +168,16 @@ def detect_suspicious_patterns(html: str, patterns: list[str]) -> list[dict]:
     return findings
 
 
-def detect_hidden_elements(html: str) -> dict:
+def detect_hidden_elements(html: str, self_domain: str = None) -> dict:
     """
     Rileva tag nascosti e contenuto offuscato in HTML.
     Identifica infrastruttura offensiva preparata ma non visibile:
     hidden forms, invisible iframes, tracking pixels, meta redirect,
     JS offuscato, commenti con codice staged, data exfiltration.
+
+    self_domain: se fornito, le risorse ospitate sullo stesso dominio (o suoi
+    sottodomini) NON vengono contate come "esterne" — un sito che carica i propri
+    /wp-content/... non è un indicatore di rischio.
     """
     findings = {
         "hidden_inputs": [],
@@ -189,6 +193,8 @@ def detect_hidden_elements(html: str) -> dict:
         "risk_indicators": 0,
         "summary": []
     }
+    # Normalizza il dominio del sito stesso (per escludere risorse self-hosted)
+    _self = (self_domain or "").lower().lstrip("www.")
 
     # ── 1. Hidden input fields ──
     hidden_inputs = re.findall(
@@ -308,11 +314,22 @@ def detect_hidden_elements(html: str) -> dict:
                 obfuscation_indicators.append("minified_with_eval")
 
         if obfuscation_indicators:
-            findings["obfuscated_js"].append({
-                "snippet": js[:300],
-                "length": len(js),
-                "indicators": obfuscation_indicators
-            })
+            # unicode/hex encoding DA SOLI non indicano offuscamento malevolo:
+            # i file WordPress (wp-emoji) e molti bundle minificati contengono
+            # decine di sequenze \uXXXX legittime. Marca "offuscato" solo se c'è
+            # un segnale di vera offuscazione (eval/atob/fromCharCode/document.write/
+            # unescape/charcode_array/minified_with_eval), oppure encoding + uno di questi.
+            strong = {"eval", "atob_base64", "document_write", "unescape",
+                      "fromCharCode", "charcode_array", "minified_with_eval"}
+            has_strong = any(ind in strong for ind in obfuscation_indicators)
+            only_encoding = all(ind.startswith("hex_encoding") or ind.startswith("unicode_encoding")
+                                for ind in obfuscation_indicators)
+            if has_strong or not only_encoding:
+                findings["obfuscated_js"].append({
+                    "snippet": js[:300],
+                    "length": len(js),
+                    "indicators": obfuscation_indicators
+                })
 
     # ── 7. Hidden divs with content ──
     hidden_div_patterns = [
@@ -336,17 +353,27 @@ def detect_hidden_elements(html: str) -> dict:
                 })
 
     # ── 8. External resources da domini terzi ──
+    def _host_of(u):
+        m = re.match(r'https?://([^/]+)', u, re.IGNORECASE)
+        return (m.group(1).lower().lstrip("www.") if m else "")
     ext_resources = set()
-    # src= e href= verso domini esterni
     for attr in ['src', 'href', 'action', 'data']:
         for m in re.finditer(rf'{attr}\s*=\s*["\']?(https?://[^"\'>\s]+)', html, re.IGNORECASE):
             url = m.group(1)
-            # Escludi CDN noti e risorse standard
-            if not any(safe in url.lower() for safe in [
+            host = _host_of(url)
+            # Escludi risorse self-hosted: stesso dominio o suo sottodominio.
+            # Un sito che carica i propri /wp-content/, /assets/... non è "esterno".
+            if _self and (host == _self or host.endswith("." + _self)):
+                continue
+            ul = url.lower()
+            # Escludi CDN noti e risorse standard (inclusi CDN WordPress/font comuni)
+            if not any(safe in ul for safe in [
                 'googleapis.com', 'gstatic.com', 'cloudflare.com', 'jquery.com',
                 'bootstrapcdn.com', 'cdnjs.com', 'jsdelivr.net', 'unpkg.com',
                 'google-analytics.com', 'googletagmanager.com', 'facebook.com',
-                'twitter.com', 'schema.org', 'w3.org'
+                'twitter.com', 'schema.org', 'w3.org',
+                'wp.com', 'wordpress.org', 'gravatar.com', 'fonts.', 'fontawesome',
+                'youtube.com', 'vimeo.com', 'linkedin.com', 'instagram.com'
             ]):
                 ext_resources.add(url)
     findings["external_resources"] = list(ext_resources)[:20]

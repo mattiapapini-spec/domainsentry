@@ -20,6 +20,8 @@ SERVICE_MAP = {
     "classifier":       ("services.classifier",       8007),
     "orchestrator":     ("services.orchestrator",     8010),
     "event-publisher":  ("services.event_publisher",  8011),
+    "case-manager":     ("services.case_manager",     8012),
+    "dashboard":        ("services.dashboard",        8013),
 }
 
 def main():

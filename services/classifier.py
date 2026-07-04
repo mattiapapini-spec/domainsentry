@@ -225,34 +225,38 @@ def baseline_diff(inp: DiffInput):
 
     is_legit = (inp.domain == inp.legitimate)
 
+    # Note: a key may be PRESENT with value None (e.g. "cert": null when a domain
+    # has no certificates). dict.get(k, {}) returns None in that case, not {}.
+    # Use (x or {}) everywhere so a None value also falls back to empty.
+
     # DNS diff
-    prev_dns = prev.get("dns", {}).get("records", {})
-    curr_dns = curr.get("dns", {}).get("records", {})
+    prev_dns = (prev.get("dns") or {}).get("records", {})
+    curr_dns = (curr.get("dns") or {}).get("records", {})
     _diff_records(prev_dns, curr_dns, alerts)
 
     # Email auth diff
-    prev_ea = prev.get("dns", {}).get("email_auth", {})
-    curr_ea = curr.get("dns", {}).get("email_auth", {})
+    prev_ea = (prev.get("dns") or {}).get("email_auth", {})
+    curr_ea = (curr.get("dns") or {}).get("email_auth", {})
     _diff_email_auth(prev_ea, curr_ea, alerts)
 
     # HTTP diff
-    prev_http = prev.get("http", {}).get("checks", [])
-    curr_http = curr.get("http", {}).get("checks", [])
-    _diff_http(prev_http, curr_http, alerts)
+    prev_http = (prev.get("http") or {}).get("checks", [])
+    curr_http = (curr.get("http") or {}).get("checks", [])
+    _diff_http(prev_http, curr_http, alerts, is_legit)
 
     # Cert diff
-    prev_certs = prev.get("cert", {}).get("ct_certificates", {})
-    curr_certs = curr.get("cert", {}).get("ct_certificates", {})
+    prev_certs = (prev.get("cert") or {}).get("ct_certificates", {})
+    curr_certs = (curr.get("cert") or {}).get("ct_certificates", {})
     _diff_certs(prev_certs, curr_certs, alerts)
 
     # WHOIS diff
-    _diff_whois(prev.get("whois", {}), curr.get("whois", {}), alerts)
+    _diff_whois(prev.get("whois") or {}, curr.get("whois") or {}, alerts)
 
     # Reputation diff
-    _diff_reputation(prev.get("reputation", {}), curr.get("reputation", {}), alerts)
+    _diff_reputation(prev.get("reputation") or {}, curr.get("reputation") or {}, alerts)
 
     # Hidden elements diff
-    _diff_hidden_elements(curr.get("http", {}), prev.get("http", {}), is_legit, alerts)
+    _diff_hidden_elements(curr.get("http") or {}, prev.get("http") or {}, is_legit, alerts)
 
     # Status complessivo
     max_sev = max((SEVERITY_MAP.get(a["type"], "LOW") for a in alerts), default="CLEAN",
@@ -282,19 +286,19 @@ def _diff_records(prev: dict, curr: dict, alerts: list):
 def _diff_email_auth(prev: dict, curr: dict, alerts: list):
     for field, alert_type in [("dmarc", "dmarc_changed"), ("dkim", "dkim_added"),
                                ("bimi", "bimi_added"), ("caa", "caa_changed")]:
-        p = prev.get(field, {}).get("present", False)
-        c = curr.get(field, {}).get("present", False)
+        p = (prev.get(field) or {}).get("present", False)
+        c = (curr.get(field) or {}).get("present", False)
         if c and not p:
             alerts.append(_alert(alert_type, f"{field.upper()} aggiunto", {}))
 
-    p_spf = prev.get("spf", {}).get("records", [])
-    c_spf = curr.get("spf", {}).get("records", [])
+    p_spf = (prev.get("spf") or {}).get("records", [])
+    c_spf = (curr.get("spf") or {}).get("records", [])
     if p_spf != c_spf and (p_spf or c_spf):
         alerts.append(_alert("spf_changed", f"SPF modificato: {p_spf} → {c_spf}",
                              {"old": p_spf, "new": c_spf}))
 
 
-def _diff_http(prev: list, curr: list, alerts: list):
+def _diff_http(prev: list, curr: list, alerts: list, is_legit: bool = False):
     prev_urls = {c["url"]: c for c in prev if isinstance(c, dict)}
     for check in curr:
         if not isinstance(check, dict):
@@ -305,9 +309,24 @@ def _diff_http(prev: list, curr: list, alerts: list):
             if not p.get("status_code") or p["status_code"] >= 400:
                 alerts.append(_alert("http_activated", f"SITO ATTIVATO: {url} (HTTP {check['status_code']})", {}))
         if check.get("suspicious_patterns"):
+            # Un'area di login è NORMALE sul dominio legittimo del cliente (portali,
+            # gestionali, webmail) e su moltissimi siti di terzi. La presenza di
+            # "login/password/utente" NON è di per sé phishing. Allerta solo quando
+            # il pattern è una NOVITÀ rispetto alla baseline (un form di credenziali
+            # comparso dove prima non c'era) E NON è il dominio legittimo.
+            if is_legit:
+                continue
+            prev_patterns = {sp.get("pattern") for sp in (p.get("suspicious_patterns") or [])}
             for sp in check["suspicious_patterns"]:
+                # solo pattern di credenziali realmente nuovi (non già presenti in baseline)
+                if sp.get("pattern") in prev_patterns:
+                    continue
+                # ignora il semplice <form action> generico: serve un segnale di credenziali
+                if "password" not in sp.get("pattern", "") and "login" not in sp.get("pattern", "") \
+                   and "sign" not in sp.get("pattern", ""):
+                    continue
                 alerts.append(_alert("credential_form_detected",
-                                     f"Pattern sospetto su {url}: {sp['pattern']}", sp))
+                                     f"Nuovo pattern di credenziali su {url}: {sp['pattern']}", sp))
 
 
 def _diff_certs(prev: dict, curr: dict, alerts: list):
@@ -331,13 +350,13 @@ def _diff_whois(prev: dict, curr: dict, alerts: list):
 
 
 def _diff_reputation(prev: dict, curr: dict, alerts: list):
-    pv = prev.get("virustotal", {})
-    cv = curr.get("virustotal", {})
+    pv = prev.get("virustotal") or {}
+    cv = curr.get("virustotal") or {}
     if cv.get("malicious", 0) > 0 and pv.get("malicious", 0) == 0:
         alerts.append(_alert("vt_malicious_detected",
                              f"VT malicious: {cv['malicious']}", cv))
-    po = prev.get("otx", {})
-    co = curr.get("otx", {})
+    po = prev.get("otx") or {}
+    co = curr.get("otx") or {}
     if co.get("pulse_count", 0) > po.get("pulse_count", 0):
         alerts.append(_alert("otx_pulse_detected",
                              f"OTX pulse: {co['pulse_count']}", co))
