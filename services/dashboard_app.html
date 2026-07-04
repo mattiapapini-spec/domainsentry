@@ -248,6 +248,12 @@
   .msel-opt:hover { background: rgba(0,233,255,.06); color: var(--text); }
   .msel-opt input { accent-color: var(--cyan); width: 15px; height: 15px; flex: none; }
   .msel-empty { padding: 8px 10px; font-size: 12px; color: var(--text-faint); font-style: italic; }
+  .user-create { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-bottom: 18px; }
+  .user-create-row { display: flex; gap: 10px; margin: 10px 0; flex-wrap: wrap; }
+  .user-create-row input, .user-create-row select { background: var(--panel-2); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 8px 12px; font-size: 13px; font-family: inherit; }
+  .user-create-row input:focus, .user-create-row select:focus { border-color: var(--cyan); outline: none; }
+  .u-role-sel { background: var(--panel-2); color: var(--text-dim); border: 1px solid var(--line); border-radius: 5px; padding: 4px 8px; font-size: 12px; font-family: inherit; }
+  .u-role-sel:disabled { opacity: .5; cursor: not-allowed; }
   .group-toggle { display: inline-flex; align-items: center; gap: 7px; padding: 8px 11px; font-size: 13px; color: var(--text-dim); cursor: pointer; user-select: none; }
   .group-toggle input { accent-color: var(--cyan); width: 15px; height: 15px; }
   .group-toggle:hover { color: var(--cyan); }
@@ -474,10 +480,15 @@
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8"/></svg>
         Add domain
       </div>
+      <div class="nav-item" id="nav-users" onclick="showUsers()" style="display:none">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="7" r="4"/><path d="M5 21v-1a7 7 0 0 1 14 0v1"/><path d="M19 8l2 2-2 2"/></svg>
+        Users
+      </div>
     </div>
     <div class="nav-spacer"></div>
     <div class="nav-foot">
       <div class="u"><span class="av" id="av"></span><span id="nav-user"></span></div>
+      <button class="btn btn-sm btn-full" onclick="openChangePw()">Change password</button>
       <button class="btn btn-sm btn-full logout" onclick="doLogout()">Sign out</button>
     </div>
   </div>
@@ -543,6 +554,26 @@
     </div>
   </div>
 
+  <!-- Change password modal (all users) -->
+  <div class="run-overlay" id="cp-overlay" onclick="if(event.target===this)closeChangePw()">
+    <div class="run-panel">
+      <div class="run-head">
+        <span class="run-title">Change password</span>
+        <button class="x" onclick="closeChangePw()">&times;</button>
+      </div>
+      <div class="run-body">
+        <label class="label">Current password</label>
+        <input id="cp-current" type="password" class="ob-in" autocomplete="current-password">
+        <label class="label" style="margin-top:14px">New password</label>
+        <input id="cp-new" type="password" class="ob-in" placeholder="min 10 characters" autocomplete="new-password">
+        <label class="label" style="margin-top:14px">Confirm new password</label>
+        <input id="cp-confirm" type="password" class="ob-in" autocomplete="new-password" onkeydown="if(event.key==='Enter')submitChangePw()">
+        <div class="run-note muted" style="margin-top:14px">You'll be signed out and need to log in again with the new password.</div>
+        <button class="btn btn-primary btn-full" id="cp-go" onclick="submitChangePw()">Update password</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Main -->
   <div class="main">
     <div id="case-view">
@@ -597,6 +628,32 @@
         <div class="ttl"><span class="bar"></span> Clients</div>
       </div>
       <div id="clients-grid" class="clients-grid"></div>
+    </div>
+
+    <div id="users-view" style="display:none">
+      <div class="toolbar">
+        <div class="ttl"><span class="bar"></span> Users</div>
+      </div>
+      <div class="user-create">
+        <div class="block-title">Create user</div>
+        <div class="user-create-row">
+          <input id="u-name" type="text" placeholder="username" autocomplete="off">
+          <input id="u-pass" type="password" placeholder="password (min 10 chars)" autocomplete="new-password">
+          <select id="u-role">
+            <option value="viewer">viewer — read-only</option>
+            <option value="analyst">analyst — triage &amp; notes</option>
+            <option value="admin">admin — full control</option>
+          </select>
+          <button class="btn btn-primary" onclick="uCreate()">Create</button>
+        </div>
+        <div class="muted" style="font-size:12px">Roles: <b>viewer</b> sees cases; <b>analyst</b> can triage, assign, whitelist; <b>admin</b> also manages clients and users.</div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>User</th><th>Role</th><th>Status</th><th>Created</th><th>By</th><th>Actions</th></tr></thead>
+          <tbody id="users-rows"></tbody>
+        </table>
+      </div>
     </div>
 
     <div id="progress-view" style="display:none">
@@ -705,6 +762,10 @@ async function boot() {
   if (can("manage_cases")) {
     $("run-scan-btn").style.display = "inline-flex";
     $("nav-manage").style.display = "block";
+  }
+  if (can("manage_users")) {
+    $("nav-manage").style.display = "block";
+    $("nav-users").style.display = "";
   }
   loadAll();
 }
@@ -896,6 +957,7 @@ function setView(v) {
   // Switch back to the case view (clients/progress views are separate)
   $("clients-view").style.display = "none";
   $("progress-view").style.display = "none";
+  $("users-view").style.display = "none";
   $("case-view").style.display = "";
   $("nav-clients").classList.remove("active");
   $("nav-progress").classList.remove("active");
@@ -917,6 +979,7 @@ function setView(v) {
 async function showClients() {
   $("case-view").style.display = "none";
   $("progress-view").style.display = "none";
+  $("users-view").style.display = "none";
   $("clients-view").style.display = "";
   stopProgressPolling();
   document.querySelectorAll(".nav-item").forEach(n => n.classList.remove("active"));
@@ -998,12 +1061,118 @@ async function openAddDomainFor(client) {
   $("ad-client").value = client;
 }
 
+// ── Users view (admin) ──
+async function showUsers() {
+  $("case-view").style.display = "none";
+  $("progress-view").style.display = "none";
+  $("clients-view").style.display = "none";
+  $("users-view").style.display = "";
+  stopProgressPolling();
+  document.querySelectorAll(".nav-item").forEach(n => n.classList.remove("active"));
+  $("nav-users").classList.add("active");
+  $("crumb-sec").textContent = "Users";
+  await loadUsers();
+}
+
+async function loadUsers() {
+  const tb = $("users-rows");
+  tb.innerHTML = '<tr><td colspan="6" class="muted">loading…</td></tr>';
+  try {
+    const r = await api("/users");
+    if (!r.users.length) { tb.innerHTML = '<tr><td colspan="6" class="muted">no users</td></tr>'; return; }
+    tb.innerHTML = r.users.map(u => {
+      const self = ME && u.id === ME.id;
+      return `<tr>
+        <td class="domain">${esc(u.username)}${self ? ' <span class="muted">(you)</span>' : ""}</td>
+        <td>
+          <select class="u-role-sel" onchange="uSetRole(${u.id}, this.value)" ${self ? "disabled title='You cannot change your own role'" : ""}>
+            ${["viewer", "analyst", "admin"].map(x => `<option value="${x}" ${u.role === x ? "selected" : ""}>${x}</option>`).join("")}
+          </select>
+        </td>
+        <td>${u.active ? '<span class="badge st-new">active</span>' : '<span class="badge st-closed_fp">disabled</span>'}</td>
+        <td class="muted">${fmtDate(u.created_at)}</td>
+        <td class="muted">${esc(u.created_by || "—")}</td>
+        <td>
+          ${self ? '<span class="muted">—</span>' : `
+            <button class="btn btn-sm" onclick="uToggleActive(${u.id}, ${u.active ? "false" : "true"})">${u.active ? "Disable" : "Enable"}</button>
+            <button class="btn btn-sm" onclick="uResetPw(${u.id}, '${esc(u.username)}')">Reset password</button>`}
+        </td>
+      </tr>`;
+    }).join("");
+  } catch (e) { tb.innerHTML = ""; toast(e.message, "bad"); }
+}
+
+async function uCreate() {
+  const username = $("u-name").value.trim();
+  const password = $("u-pass").value;
+  const role = $("u-role").value;
+  if (!username) { toast("enter a username", "bad"); return; }
+  if (password.length < 10) { toast("password must be at least 10 characters", "bad"); return; }
+  try {
+    await api("/users", { method: "POST", body: JSON.stringify({ username, password, role }) });
+    toast(`user '${username}' created (${role})`, "ok");
+    $("u-name").value = ""; $("u-pass").value = ""; $("u-role").value = "viewer";
+    loadUsers();
+  } catch (e) { toast(e.message, "bad"); }
+}
+
+async function uSetRole(id, role) {
+  try {
+    await api(`/users/${id}`, { method: "PATCH", body: JSON.stringify({ role }) });
+    toast("role updated", "ok"); loadUsers();
+  } catch (e) { toast(e.message, "bad"); loadUsers(); }
+}
+
+async function uToggleActive(id, active) {
+  try {
+    await api(`/users/${id}`, { method: "PATCH", body: JSON.stringify({ active }) });
+    toast(active ? "user enabled" : "user disabled", "ok"); loadUsers();
+  } catch (e) { toast(e.message, "bad"); }
+}
+
+async function uResetPw(id, username) {
+  const pw = prompt(`New password for '${username}' (min 10 characters):`);
+  if (pw == null) return;
+  if (pw.length < 10) { toast("password must be at least 10 characters", "bad"); return; }
+  try {
+    await api(`/users/${id}/password`, { method: "POST", body: JSON.stringify({ password: pw }) });
+    toast(`password reset for '${username}'`, "ok");
+  } catch (e) { toast(e.message, "bad"); }
+}
+
+// ── Change own password (all users) ──
+function openChangePw() {
+  $("cp-current").value = ""; $("cp-new").value = ""; $("cp-confirm").value = "";
+  $("cp-overlay").classList.add("open");
+  setTimeout(() => $("cp-current").focus(), 50);
+}
+function closeChangePw() { $("cp-overlay").classList.remove("open"); }
+
+async function submitChangePw() {
+  const cur = $("cp-current").value, nw = $("cp-new").value, cf = $("cp-confirm").value;
+  if (!cur) { toast("enter your current password", "bad"); return; }
+  if (nw.length < 10) { toast("new password must be at least 10 characters", "bad"); return; }
+  if (nw !== cf) { toast("new passwords don't match", "bad"); return; }
+  if (nw === cur) { toast("new password must differ from the current one", "bad"); return; }
+  try {
+    await api(`/users/${ME.id}/password`, {
+      method: "POST",
+      body: JSON.stringify({ current_password: cur, password: nw })
+    });
+    closeChangePw();
+    toast("password changed — please sign in again", "ok");
+    // sessions are revoked server-side; send the user to login
+    setTimeout(() => doLogout(), 1200);
+  } catch (e) { toast(e.message, "bad"); }
+}
+
 // ── Scan progress view (polls /progress for real pipeline state) ──
 let PROG_TIMER = null;
 
 function showProgress() {
   $("case-view").style.display = "none";
   $("clients-view").style.display = "none";
+  $("users-view").style.display = "none";
   $("progress-view").style.display = "";
   document.querySelectorAll(".nav-item").forEach(n => n.classList.remove("active"));
   $("nav-progress").classList.add("active");

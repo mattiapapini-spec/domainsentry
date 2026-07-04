@@ -138,6 +138,23 @@ engine, put it behind the case-manager (which does authenticate) or add your own
 - API keys (VirusTotal, OTX, SecurityTrails) live in `.env`, which is gitignored. Never
   commit real keys.
 
+### Hardening built in
+
+- **SSRF protection.** The engine fetches user-supplied domains, so every outbound HTTP
+  request is validated: the target host is resolved and requests to internal addresses
+  (cloud metadata `169.254.169.254`, loopback, RFC1918/private ranges, link-local) are
+  refused, and redirects are followed manually so each hop is re-checked (a public site
+  can't 302 the fetcher into the internal network). Set `SSRF_PROTECTION=false` only for
+  trusted offline labs.
+- **Login rate limiting.** Failed logins are throttled per client IP
+  (`LOGIN_MAX_FAILURES` in `LOGIN_WINDOW_SEC`, default 5 / 300s) to blunt brute-force and
+  credential stuffing. For multi-instance deployments, also front with a WAF/proxy.
+- **Password storage.** PBKDF2-HMAC-SHA256, 600k iterations, per-user random salt.
+  Session tokens are random and stored hashed, so a database leak exposes neither
+  passwords nor usable tokens. Changing your own password requires the current one.
+- **Other:** parameterized SQL throughout, path-traversal-safe file naming, timing-safe
+  token/password comparison, security headers on every response, and a request-size limit.
+
 ## Architecture
 
 ```

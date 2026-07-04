@@ -23,7 +23,7 @@ from shared.security import apply_security
 logger = logging.getLogger("dashboard")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [DASH] %(message)s")
 
-app = FastAPI(title="DomainSentry Dashboard", version="4.14.0")
+app = FastAPI(title="DomainSentry Dashboard", version="4.17.0")
 apply_security(app)
 router = APIRouter()
 
@@ -37,7 +37,7 @@ except FileNotFoundError:
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "service": "dashboard", "version": "4.14.0"}
+    return {"status": "healthy", "service": "dashboard", "version": "4.17.0"}
 
 
 @router.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)

@@ -10,6 +10,7 @@ import re
 import time
 import logging
 import socket
+import os as _os
 from datetime import datetime, timezone, timedelta
 
 try:
@@ -24,8 +25,54 @@ logger = logging.getLogger("shared")
 
 
 # ═══════════════════════════════════════════════════════════════
-# DNS
+# SSRF PROTECTION
 # ═══════════════════════════════════════════════════════════════
+import ipaddress
+from urllib.parse import urlparse, urljoin as _urljoin
+
+# Allow opting out in trusted/offline labs, but default is SAFE (block internal).
+SSRF_PROTECTION = _os.environ.get("SSRF_PROTECTION", "true").lower() != "false"
+
+
+def _is_blocked_ip(ip_str: str) -> bool:
+    """True if an IP is private, loopback, link-local, or otherwise internal —
+    the targets an SSRF attack would aim for (cloud metadata 169.254.169.254,
+    localhost, RFC1918 ranges, the internal Docker network, etc.)."""
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return True  # unparseable → block, fail closed
+    return (
+        ip.is_private or ip.is_loopback or ip.is_link_local or
+        ip.is_reserved or ip.is_multicast or ip.is_unspecified or
+        ip_str == "169.254.169.254"  # cloud metadata (explicit)
+    )
+
+
+def is_safe_url(url: str) -> tuple[bool, str]:
+    """Resolve the URL's host and verify it does NOT point at an internal address.
+    Returns (safe, reason). Used to gate outbound fetches against SSRF."""
+    if not SSRF_PROTECTION:
+        return True, "ssrf-protection-disabled"
+    try:
+        host = urlparse(url).hostname
+        if not host:
+            return False, "no host in URL"
+        # Resolve ALL addresses the host maps to; block if ANY is internal
+        # (defends against DNS that returns both a public and an internal A record).
+        infos = socket.getaddrinfo(host, None)
+        for info in infos:
+            ip = info[4][0]
+            if _is_blocked_ip(ip):
+                return False, f"host {host} resolves to internal address {ip}"
+        return True, "ok"
+    except socket.gaierror:
+        return False, "host does not resolve"
+    except Exception as e:
+        return False, f"url validation failed: {e}"
+
+
+
 
 def dig_query(fqdn: str, rtype: str, timeout: int = 10) -> list[str]:
     try:
@@ -57,6 +104,12 @@ def http_get_with_retry(url, timeout=15, verify_ssl=False, max_attempts=3, base_
     ua = "Mozilla/5.0 (compatible; SOC-DomainIntelligence/4.0)"
     retryable = {429, 500, 502, 503, 504}
 
+    # SSRF guard: refuse to fetch a URL whose host resolves to an internal address.
+    safe, reason = is_safe_url(url)
+    if not safe:
+        result["error"] = f"blocked (SSRF protection): {reason}"
+        return result
+
     for attempt in range(1, max_attempts + 1):
         result["attempts"] = attempt
         result["error"] = None
@@ -64,11 +117,26 @@ def http_get_with_retry(url, timeout=15, verify_ssl=False, max_attempts=3, base_
             if HAS_REQUESTS:
                 import urllib3
                 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-                resp = req_lib.get(url, timeout=timeout, allow_redirects=True,
-                                   headers={"User-Agent": ua}, verify=verify_ssl)
+                # Follow redirects manually so each hop is re-validated against SSRF
+                # (a public site can 302 to http://169.254.169.254/ — allow_redirects
+                # would follow it blindly).
+                cur = url
+                resp = None
+                for _hop in range(5):
+                    resp = req_lib.get(cur, timeout=timeout, allow_redirects=False,
+                                       headers={"User-Agent": ua}, verify=verify_ssl)
+                    if resp.status_code in (301, 302, 303, 307, 308) and "location" in resp.headers:
+                        nxt = _urljoin(cur, resp.headers["location"])
+                        ok, why = is_safe_url(nxt)
+                        if not ok:
+                            result["error"] = f"blocked redirect (SSRF protection): {why}"
+                            return result
+                        cur = nxt
+                        continue
+                    break
                 result.update({"status_code": resp.status_code, "content": resp.content,
                                "headers": dict(resp.headers),
-                               "final_url": resp.url if resp.url != url else None})
+                               "final_url": cur if cur != url else None})
                 if resp.status_code in retryable and attempt < max_attempts:
                     time.sleep(base_delay * (2 ** (attempt - 1)))
                     continue
@@ -80,9 +148,15 @@ def http_get_with_retry(url, timeout=15, verify_ssl=False, max_attempts=3, base_
                     ctx.check_hostname = False
                     ctx.verify_mode = ssl.CERT_NONE
                 with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                    final = resp.geturl()
+                    if final != url:
+                        ok, why = is_safe_url(final)
+                        if not ok:
+                            result["error"] = f"blocked redirect (SSRF protection): {why}"
+                            return result
                     result.update({"content": resp.read(), "status_code": resp.getcode(),
                                    "headers": dict(resp.headers),
-                                   "final_url": resp.geturl() if resp.geturl() != url else None})
+                                   "final_url": final if final != url else None})
                 return result
         except Exception as e:
             result["error"] = f"Attempt {attempt}/{max_attempts}: {e}"

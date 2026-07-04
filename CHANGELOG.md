@@ -2,6 +2,47 @@
 
 All notable changes to this project will be documented in this file.
 
+## [4.17.0] - 2026-07-04
+
+### Security
+- **SSRF protection on outbound fetches.** The engine resolves user-supplied domains and
+  refuses requests to internal addresses (cloud metadata 169.254.169.254, loopback,
+  RFC1918/private, link-local). Redirects are now followed manually and re-validated at
+  each hop, so a public site can't 302 the fetcher into the internal network. Toggle with
+  `SSRF_PROTECTION` (default on). Closes an SSRF vector inherent to a tool that fetches
+  arbitrary domains. 4 regression tests.
+- **Login rate limiting.** Failed logins are throttled per client IP
+  (`LOGIN_MAX_FAILURES` / `LOGIN_WINDOW_SEC`, default 5 per 300s) → HTTP 429, to blunt
+  brute-force and credential stuffing. Successful login clears the counter. 1 test.
+
+### Notes
+- Full internal security audit performed (SQLi, path traversal, auth, secrets, CORS,
+  error leakage): SQL is parameterized, file naming is traversal-safe, token/password
+  comparison is timing-safe, PBKDF2 is 600k iterations, tokens are stored hashed, and no
+  secrets are hardcoded. The two items above were the findings; both are now fixed.
+
+## [4.16.0] - 2026-07-04
+
+### Added
+- **Self-service password change for all users.** A "Change password" action in the
+  sidebar (available to every role) opens a modal requiring the current password plus
+  the new one (confirmed). On success the session is revoked and the user re-logs in.
+- **Current-password verification on self-change (backend).** `POST /users/{id}/password`
+  now requires the correct current password when a user changes their OWN password
+  (a hijacked session can't silently rotate it); an admin resetting someone else's
+  password still doesn't need the target's current password. 5 regression tests cover
+  the self/admin/wrong-current/cross-user paths.
+
+## [4.15.0] - 2026-07-04
+
+### Added
+- **User management in the dashboard (admin).** New "Users" view (visible only with
+  `manage_users`): create users (username, password, role viewer/analyst/admin),
+  change roles inline, enable/disable accounts, and reset passwords — no more curl
+  required to onboard an analyst. The UI prevents self-demotion/self-disable; the
+  backend already guarded the case that matters (the last active admin cannot be
+  demoted or disabled, and disabling a user revokes their sessions).
+
 ## [4.14.0] - 2026-07-04
 
 ### Changed

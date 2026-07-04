@@ -224,3 +224,31 @@ class TestHiddenElementsFalsePositives:
         r = detect_hidden_elements(html, self_domain="kerdion-fake.com")
         ext = r.get("external_resources", [])
         assert any("evil-exfil.ru" in u for u in ext)
+
+
+class TestSSRFProtection:
+    """The tool fetches user-supplied domains; it must not be usable to reach
+    internal infrastructure (cloud metadata, localhost, private ranges)."""
+    def test_internal_ips_blocked(self):
+        from shared.utils import _is_blocked_ip
+        for ip in ["169.254.169.254", "127.0.0.1", "10.0.0.1", "192.168.1.1",
+                   "172.16.0.1", "0.0.0.0", "::1", "fe80::1"]:
+            assert _is_blocked_ip(ip) is True, ip
+
+    def test_public_ip_allowed(self):
+        from shared.utils import _is_blocked_ip
+        assert _is_blocked_ip("8.8.8.8") is False
+        assert _is_blocked_ip("1.1.1.1") is False
+
+    def test_is_safe_url_blocks_localhost_and_metadata(self):
+        from shared.utils import is_safe_url
+        for u in ["http://127.0.0.1/x", "http://169.254.169.254/latest/meta-data/",
+                  "http://localhost:8010/trigger"]:
+            safe, _ = is_safe_url(u)
+            assert safe is False, u
+
+    def test_fetch_refuses_internal(self):
+        from shared.utils import http_get_with_retry
+        r = http_get_with_retry("http://127.0.0.1:8010/trigger", max_attempts=1)
+        assert r["status_code"] is None
+        assert "SSRF" in (r["error"] or "")

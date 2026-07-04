@@ -144,6 +144,64 @@ class TestUserManagement:
         })
         assert resp.status_code == 422
 
+    def test_user_changes_own_password_with_current(self):
+        admin = self._admin_token()
+        client.post("/users", headers=_auth_header(admin), json={
+            "username": "selfpw", "password": "old_password_1", "role": "viewer"
+        })
+        tok = _login("selfpw", "old_password_1").json()["token"]
+        uid = client.get("/auth/me", headers=_auth_header(tok)).json()["id"]
+        # correct current password → allowed
+        r = client.post(f"/users/{uid}/password", headers=_auth_header(tok),
+                        json={"current_password": "old_password_1", "password": "new_password_2"})
+        assert r.status_code == 200
+        # old password no longer works, new one does
+        assert _login("selfpw", "old_password_1").status_code == 401
+        assert _login("selfpw", "new_password_2").status_code == 200
+
+    def test_self_password_change_requires_correct_current(self):
+        admin = self._admin_token()
+        client.post("/users", headers=_auth_header(admin), json={
+            "username": "selfpw2", "password": "orig_password_1", "role": "viewer"
+        })
+        tok = _login("selfpw2", "orig_password_1").json()["token"]
+        uid = client.get("/auth/me", headers=_auth_header(tok)).json()["id"]
+        # wrong current password → 403
+        r = client.post(f"/users/{uid}/password", headers=_auth_header(tok),
+                        json={"current_password": "WRONG", "password": "another_pw_9"})
+        assert r.status_code == 403
+        # missing current password → 400
+        r2 = client.post(f"/users/{uid}/password", headers=_auth_header(tok),
+                         json={"password": "another_pw_9"})
+        assert r2.status_code == 400
+
+    def test_admin_resets_other_without_current(self):
+        admin = self._admin_token()
+        client.post("/users", headers=_auth_header(admin), json={
+            "username": "resetme", "password": "initial_pw_1", "role": "analyst"
+        })
+        uid = None
+        users = client.get("/users", headers=_auth_header(admin)).json()["users"]
+        uid = next(u["id"] for u in users if u["username"] == "resetme")
+        # admin reset needs no current_password
+        r = client.post(f"/users/{uid}/password", headers=_auth_header(admin),
+                        json={"password": "admin_set_pw_2"})
+        assert r.status_code == 200
+        assert _login("resetme", "admin_set_pw_2").status_code == 200
+
+    def test_user_cannot_change_others_password(self):
+        admin = self._admin_token()
+        for n in ["viewerA", "viewerB"]:
+            client.post("/users", headers=_auth_header(admin), json={
+                "username": n, "password": f"{n}_password_1", "role": "viewer"
+            })
+        tokA = _login("viewerA", "viewerA_password_1").json()["token"]
+        users = client.get("/users", headers=_auth_header(admin)).json()["users"]
+        uidB = next(u["id"] for u in users if u["username"] == "viewerB")
+        r = client.post(f"/users/{uidB}/password", headers=_auth_header(tokA),
+                        json={"current_password": "x", "password": "hijack_pw_9"})
+        assert r.status_code == 403
+
     def test_duplicate_username_rejected(self):
         token = self._admin_token()
         client.post("/users", headers=_auth_header(token), json={
@@ -409,3 +467,22 @@ def teardown_module(module):
     os.environ["CASES_DB"] = os.path.join(_tmpdir, "test_cases.db")
     import services.case_manager as cm
     importlib.reload(cm)
+
+
+class TestLoginRateLimit:
+    """Failed logins from one IP must be throttled to blunt brute-force."""
+    def test_repeated_failures_get_429(self):
+        import services.case_manager as cm
+        cm._login_failures.clear()          # isolate from other tests
+        orig = cm.LOGIN_MAX_FAILURES
+        cm.LOGIN_MAX_FAILURES = 3
+        try:
+            codes = [client.post("/auth/login",
+                                 json={"username": "admin", "password": "nope"}).status_code
+                     for _ in range(5)]
+            assert 429 in codes
+            assert codes[:3] == [401, 401, 401]
+            assert codes[3] == 429
+        finally:
+            cm.LOGIN_MAX_FAILURES = orig
+            cm._login_failures.clear()

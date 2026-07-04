@@ -26,7 +26,7 @@ from pathlib import Path
 from contextlib import contextmanager
 
 import requests
-from fastapi import FastAPI, APIRouter, Depends, HTTPException, Header
+from fastapi import FastAPI, APIRouter, Depends, HTTPException, Header, Request
 from fastapi.responses import JSONResponse
 from shared.compat import BaseModel, field_validator
 
@@ -238,8 +238,37 @@ class LoginRequest(BaseModel):
     password: str
 
 
+# ── Login rate limiting (brute-force / credential-stuffing mitigation) ──
+import time as _time
+LOGIN_MAX_FAILURES = int(os.environ.get("LOGIN_MAX_FAILURES", "5"))
+LOGIN_WINDOW_SEC = int(os.environ.get("LOGIN_WINDOW_SEC", "300"))  # 5 min
+_login_failures: dict = {}  # ip -> [timestamps of recent failures]
+
+
+def _rl_check(ip: str):
+    now = _time.time()
+    fails = [t for t in _login_failures.get(ip, []) if now - t < LOGIN_WINDOW_SEC]
+    _login_failures[ip] = fails
+    if len(fails) >= LOGIN_MAX_FAILURES:
+        retry = int(LOGIN_WINDOW_SEC - (now - fails[0]))
+        raise HTTPException(429, f"Too many failed login attempts. Try again in {retry}s.")
+
+
+def _rl_record_failure(ip: str):
+    _login_failures.setdefault(ip, []).append(_time.time())
+
+
+def _rl_reset(ip: str):
+    _login_failures.pop(ip, None)
+
+
 @router.post("/auth/login", tags=["Auth"])
-def login(req: LoginRequest):
+def login(req: LoginRequest, request: Request):
+    # Rate limit failed logins per client IP to blunt brute-force / credential
+    # stuffing. In-memory sliding window; resets on restart (acceptable for a
+    # single-instance deployment — for multi-instance, front with a WAF/proxy).
+    client_ip = request.client.host if request.client else "unknown"
+    _rl_check(client_ip)
     with get_db() as conn:
         row = conn.execute(
             "SELECT id, password_hash, salt, active FROM users WHERE username = ?",
@@ -252,10 +281,12 @@ def login(req: LoginRequest):
             verify_password(req.password, "0" * 64, "0" * 32)
             ok = False
         if not row or not ok:
+            _rl_record_failure(client_ip)
             raise HTTPException(401, "Invalid credentials")
         if not row["active"]:
             raise HTTPException(403, "User account disabled")
 
+        _rl_reset(client_ip)  # successful login clears the counter
         token = generate_token()
         expires = (datetime.now(timezone.utc) + timedelta(hours=TOKEN_TTL_HOURS)).isoformat()
         conn.execute(
@@ -411,6 +442,7 @@ def update_user(user_id: int, req: UserUpdate, admin=Depends(require("manage_use
 
 class PasswordReset(BaseModel):
     password: str
+    current_password: Optional[str] = None  # required for self-change, not for admin reset
 
     @field_validator("password")
     @classmethod
@@ -422,14 +454,25 @@ class PasswordReset(BaseModel):
 
 @router.post("/users/{user_id}/password", tags=["Users"])
 def reset_password(user_id: int, req: PasswordReset, user=Depends(get_current_user)):
-    # Admin can reset anyone; users can reset their own
-    if "manage_users" not in user["permissions"] and user["id"] != user_id:
+    is_admin = "manage_users" in user["permissions"]
+    is_self = user["id"] == user_id
+    # Admin can reset anyone; a non-admin can only change their own password.
+    if not is_admin and not is_self:
         raise HTTPException(403, "Can only change your own password")
-    ph, salt = hash_password(req.password)
     with get_db() as conn:
-        r = conn.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
-        if not r:
+        row = conn.execute("SELECT id, password_hash, salt FROM users WHERE id = ?", (user_id,)).fetchone()
+        if not row:
             raise HTTPException(404, "User not found")
+        # When a user changes their OWN password, require the current one (standard
+        # practice: a hijacked session shouldn't be able to silently rotate the
+        # password). An admin resetting someone else's password is an administrative
+        # reset and doesn't need the target's current password.
+        if is_self:
+            if not req.current_password:
+                raise HTTPException(400, "Current password required to change your own password")
+            if not verify_password(req.current_password, row["password_hash"], row["salt"]):
+                raise HTTPException(403, "Current password is incorrect")
+        ph, salt = hash_password(req.password)
         conn.execute("UPDATE users SET password_hash=?, salt=? WHERE id=?", (ph, salt, user_id))
         # Revoke existing sessions on password change
         conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
