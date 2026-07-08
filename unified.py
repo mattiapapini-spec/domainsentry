@@ -83,7 +83,7 @@ def health():
     return {
         "status": "healthy",
         "service": "domainsentry-unified",
-        "version": "4.17.0",
+        "version": "4.18.2",
         "mode": "unified",
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
@@ -135,7 +135,7 @@ def root():
             endpoints["dashboard"] = {"ui": "/dashboard"}
     return {
         "name": "DomainSentry",
-        "version": "4.17.0",
+        "version": "4.18.2",
         "mode": "unified",
         "case_manager": "enabled" if ENABLE_CASE_MANAGER else "disabled",
         "docs": "/docs",

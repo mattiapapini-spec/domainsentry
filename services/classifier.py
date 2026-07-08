@@ -7,7 +7,7 @@ import os, json, logging
 from pathlib import Path
 from fastapi import FastAPI, APIRouter, Query
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 
 from shared.security import apply_security, sanitize_error, sanitize_log_input
@@ -45,27 +45,102 @@ class VariantInput(BaseModel):
 
 
 @router.post("/classify/variant", tags=["Classification"])
+def classify_variant_endpoint(v: VariantInput):
+    return classify_variant(v)
+
+
+def _domain_age(whois_data: dict) -> dict:
+    """Analizza l'età del dominio dai dati WHOIS.
+
+    Ritorna: {age_days, created, updated, recently_reregistered}.
+    La data di registrazione è il discriminante più forte per il typosquatting:
+    un dominio registrato PRIMA dell'inizio di una campagna ostile è quasi sempre
+    una terza parte legittima, mentre uno registrato di recente è un candidato reale.
+
+    ATTENZIONE ai falsi negativi: un dominio scaduto e RI-REGISTRATO da un attaccante
+    ha una creation_date vecchia ma è pericoloso. Rileviamo questo caso confrontando
+    updated_date con creation_date: se il dominio è "vecchio" ma aggiornato di recente
+    (possibile cambio di titolare), NON lo trattiamo come terza parte sicura.
+    """
+    from datetime import datetime, timezone
+    out = {"age_days": None, "created": None, "updated": None, "recently_reregistered": False}
+
+    def _coerce(val):
+        # python-whois often returns creation_date/updated_date as a LIST of dates
+        # (multiple registry records). Take the earliest for creation. Also accept
+        # datetime objects directly.
+        # SECURITY: the registrant controls their own WHOIS, so cap work to prevent
+        # a hostile record (huge list / huge string) from causing CPU DoS.
+        if val is None:
+            return None
+        if isinstance(val, list):
+            parsed = [p for p in (_parse(x) for x in val[:10]) if p]
+            return min(parsed) if parsed else None
+        if isinstance(val, datetime):
+            return val.replace(tzinfo=None)
+        return _parse(val)
+
+    def _parse(s):
+        if isinstance(s, datetime):
+            return s.replace(tzinfo=None)
+        # Only strings carry a parseable date; ignore dict/bytes/int/nested lists.
+        if not isinstance(s, str):
+            return None
+        # Bound length: a real date string is short; anything longer is junk/hostile.
+        s = s.strip()[:40]
+        # normalize: drop trailing Z, fractional seconds, timezone offsets
+        s = s.replace("Z", "").split(".")[0].split("+")[0].strip()
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d",
+                    "%d-%b-%Y", "%Y/%m/%d", "%d/%m/%Y", "%d.%m.%Y"):
+            try:
+                return datetime.strptime(s[:19] if "T" in s or ":" in s else s[:10], fmt)
+            except ValueError:
+                continue
+        return None
+
+    created = _coerce(whois_data.get("creation_date"))
+    updated = _coerce(whois_data.get("updated_date"))
+    if not created:
+        return out
+    now = datetime.utcnow()
+    age_days = (now - created).days
+    # A creation date in the future is corrupt/hostile WHOIS data: clamp to 0 and
+    # treat as "unknown age" rather than a large negative number.
+    if age_days < 0:
+        return out
+    out["age_days"] = age_days
+    out["created"] = created.strftime("%Y-%m-%d")
+    if updated:
+        out["updated"] = updated.strftime("%Y-%m-%d")
+        days_since_update = (now - updated).days
+        if age_days > 730 and 0 <= days_since_update < 120:
+            out["recently_reregistered"] = True
+    return out
+
+
 def classify_variant(v: VariantInput):
     """Auto-classificazione di una variante dnstwist."""
-    logger.info(f"Classify variant: {v.domain} ({v.fuzzer})")
+    logger.info(f"Classify variant: {sanitize_log_input(v.domain)} ({sanitize_log_input(v.fuzzer)})")
 
     dns = v.dns or {}
     http = v.http or {}
     cert = v.cert or {}
+    whois_data = v.whois or {}
 
-    records = dns.get("records", {})
-    a_records = records.get("A", [])
-    mx_records = records.get("MX", [])
-    ns_records = records.get("NS", [])
+    records = dns.get("records") or {}
+    a_records = records.get("A") or []
+    mx_records = records.get("MX") or []
+    ns_records = records.get("NS") or []
 
     # Estrai info HTTP
-    http_checks = http.get("checks", [])
+    http_checks = [c for c in (http.get("checks") or []) if isinstance(c, dict)]
     any_http_active = any(c.get("status_code") and c["status_code"] < 400 for c in http_checks)
     max_content_len = max((c.get("content_length") or 0 for c in http_checks), default=0)
 
     # Estrai info cert
-    cert_total = cert.get("ct_certificates", {}).get("total", 0)
-    cert_cns = cert.get("ct_certificates", {}).get("unique_cn", [])
+    _ct = cert.get("ct_certificates") or {}
+    cert_total = _ct.get("total", 0)
+    cert_cns = _ct.get("unique_cn") or []
 
     mx_str = " ".join(mx_records).lower()
     ns_str = " ".join(ns_records).lower()
@@ -121,7 +196,12 @@ def classify_variant(v: VariantInput):
                        "enterprise_cert_provider",
                        f"Certificati di provider enterprise: {cert_cns}")
 
-    if any_http_active and max_content_len > 3000:
+    # Un sito con contenuto sostanziale è di norma legittimo, MA se il dominio è
+    # recente E ha MX attivo, il "sito di facciata + email" è un profilo di typosquat,
+    # non di terza parte legittima: non declassare, lascialo alla verifica.
+    _age_pre = _domain_age(whois_data)
+    _recent = _age_pre["age_days"] is not None and _age_pre["age_days"] < 540
+    if any_http_active and max_content_len > 3000 and not (_recent and mx_records):
         return _result(v.domain, "legitimate_probable", "low",
                        "http_active_substantial_content",
                        f"Sito attivo con contenuto sostanziale ({max_content_len}b)")
@@ -148,6 +228,29 @@ def classify_variant(v: VariantInput):
                        "hidden_elements_moderate",
                        f"Tag nascosti rilevati ({hidden_risk}/100): {'; '.join(hidden_summary[:3])}")
 
+    # ── ETÀ DEL DOMINIO (punto 1) ──
+    # La data di registrazione è il discriminante più forte: un dominio registrato
+    # molto prima di una campagna ostile, e inerte da allora, è quasi sempre una
+    # terza parte legittima. Questo toglie dalla coda i molti domini pre-campagna
+    # (nomi propri, terzi storici) oggi marcati genericamente "needs_review".
+    age = _domain_age(whois_data)
+    if age["age_days"] is not None:
+        # Cautela anti-falso-negativo: se il dominio è vecchio MA aggiornato di recente
+        # (possibile ri-registrazione dopo scadenza / cambio titolare), NON lo declassiamo.
+        if age["recently_reregistered"]:
+            return _result(v.domain, "needs_review", "medium",
+                           "old_domain_recently_updated",
+                           f"Dominio datato ({age['created']}) ma aggiornato di recente ({age['updated']}), "
+                           f"possibile ri-registrazione, verifica manuale")
+        # Vecchio (>18 mesi) e senza segnali ostili emersi sopra → terza parte probabile
+        if age["age_days"] > 540:
+            yrs = age["age_days"] // 365
+            return _result(v.domain, "likely_third_party", "low",
+                           "predates_campaign",
+                           f"Registrato il {age['created']} (~{yrs} anni fa), prima della finestra "
+                           f"tipica di registrazione ostile e senza segnali di minaccia, "
+                           f"probabile terza parte preesistente")
+
     # DA VERIFICARE
     return _result(v.domain, "needs_review", "low",
                    "no_matching_rule",
@@ -159,6 +262,7 @@ def _result(domain, category, confidence, rule, rationale):
         "parking": "monitor_passive",
         "for_sale": "monitor_passive",
         "legitimate_probable": "whitelist_candidate",
+        "likely_third_party": "whitelist_candidate",
         "suspicious": "block_and_monitor",
         "needs_review": "manual_review"
     }
@@ -178,14 +282,16 @@ def _result(domain, category, confidence, rule, rationale):
 # ═══════════════════════════════════════════════════════════════
 
 class BatchInput(BaseModel):
-    variants: list[VariantInput]
+    # Cap batch size: a legitimate scan classifies at most a few hundred variants;
+    # an unbounded list is a DoS vector.
+    variants: list[VariantInput] = Field(..., max_length=1000)
 
 
 @router.post("/classify/batch", tags=["Classification"])
 def classify_batch(batch: BatchInput):
     """Classifica un batch di varianti."""
     results = []
-    counts = {"parking": 0, "for_sale": 0, "legitimate_probable": 0,
+    counts = {"parking": 0, "for_sale": 0, "legitimate_probable": 0, "likely_third_party": 0,
               "suspicious": 0, "needs_review": 0}
 
     for v in batch.variants:
@@ -218,7 +324,7 @@ class DiffInput(BaseModel):
 @router.post("/diff", tags=["Diffing"])
 def baseline_diff(inp: DiffInput):
     """Confronta stato corrente con baseline, genera alert."""
-    logger.info(f"Diff: {inp.domain} client={inp.client}")
+    logger.info(f"Diff: {sanitize_log_input(inp.domain)} client={sanitize_log_input(inp.client)}")
     alerts = []
     prev = inp.baseline or {}
     curr = inp.current

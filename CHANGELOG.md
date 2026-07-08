@@ -2,6 +2,59 @@
 
 All notable changes to this project will be documented in this file.
 
+## [4.18.2] - 2026-07-07
+
+### Security
+- **Security audit of the WHOIS-parsing path (registrant-controlled input).** Since a
+  domain's registrant controls its own WHOIS record, the age parser processes
+  attacker-controlled data. Audit findings, all fixed:
+  - **DoS via huge date list**: a hostile WHOIS returning a giant `creation_date` list
+    took ~860ms to parse; now capped at 10 dates (~0.2ms). Date strings are length-bounded.
+  - **Log injection**: date values containing newlines could forge log lines. The
+    classifier's log statements now pass domain/fuzzer/client through `sanitize_log_input`
+    (was imported but unused on those lines); parsed dates are reformatted, so raw
+    values never reach output.
+  - **Type confusion**: dict/bytes/nested-list/huge-int date values are now safely
+    rejected instead of coerced.
+  - **Batch DoS**: `/classify/batch` had no size limit; capped at 1000 variants (422 above).
+  - 5 security regression tests. 7 real client datasets classify identically (no behavior change).
+
+## [4.18.1] - 2026-07-07
+
+### Fixed
+- **Classifier robustness (bug hunt on the v4.18.0 age logic).** Fixed crashes and a
+  silent failure found by fuzzing the classifier with malformed/partial input:
+  - **WHOIS list-dates**: python-whois frequently returns `creation_date`/`updated_date`
+    as a LIST of dates; the age rule silently ignored these (returned age=None), so the
+    age classification never fired for those domains. Now takes the earliest date.
+  - **Future creation dates**: corrupt/hostile WHOIS with a future date produced a
+    negative age; now normalized to unknown.
+  - **Additional date formats** parsed (fractional seconds, Z suffix, timezone offsets,
+    slash-separated).
+  - **None sub-objects** (`dns.records`, `http.checks`, `cert.ct_certificates` set to
+    null, or None entries inside the checks list) caused 500 crashes; now handled
+    gracefully. These are preexisting issues surfaced by the hunt.
+  - 7 regression tests. Verified the 7 real client datasets classify identically to
+    v4.18.0 (no behavior change, only crash/robustness fixes).
+
+## [4.18.0] - 2026-07-07
+
+### Improved
+- **Classifier now uses domain registration age (the strongest typosquatting signal).**
+  Previously the classifier ignored WHOIS creation date and dropped most variants into
+  `needs_review`, leaving ~80% of triage to the analyst. It now auto-classifies a domain
+  that predates the hostile-registration window (>18 months old) and shows no threat
+  signals as `likely_third_party` (LOW), clearing it from the manual queue. Measured on
+  7 real client datasets: `needs_review` dropped from 82 to 11 domains, with zero false
+  negatives (all known threats stay flagged).
+- **Anti-false-negative guards** built into the age rule:
+  - An old domain *updated* within the last ~120 days (possible drop-catch / owner
+    change) is NOT auto-cleared, it goes to `needs_review` (`old_domain_recently_updated`).
+  - A **recent** domain with active MX is no longer auto-cleared as legitimate even if it
+    serves a substantial website (facade site + email = typosquat profile), closing a
+    false-negative found in testing (a recent look-alike with a decoy page + mail).
+- New `likely_third_party` classification (action: whitelist_candidate). 4 regression tests.
+
 ## [4.17.0] - 2026-07-04
 
 ### Security

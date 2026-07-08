@@ -193,3 +193,123 @@ class TestDiffNoneSafety:
         types = {a["type"] for a in body["alerts"]}
         assert "mx_record_changed" in types
         assert "http_activated" in types
+
+
+class TestDomainAgeRule:
+    """Point 1: domain-age classification. An old, inert domain that predates a
+    campaign is likely a legitimate third party; but a recent domain with MX (even
+    with a facade website) must stay flagged, and an old domain re-registered
+    recently must NOT be auto-cleared."""
+
+    def _classify(self, domain, whois=None, dns=None, http=None, cert=None):
+        from services.classifier import classify_variant, VariantInput
+        import json
+        vi = VariantInput(domain=domain, whois=whois or {}, dns=dns or {},
+                          http=http or {}, cert=cert or {})
+        return json.loads(classify_variant(vi).body)
+
+    def test_old_inert_domain_is_third_party(self):
+        r = self._classify("kedrlon.com",
+                            whois={"creation_date": "2019-10-09T00:00:00"},
+                            dns={"records": {"A": ["1.2.3.4"]}})
+        assert r["auto_classification"] == "likely_third_party"
+        assert r["confidence"] == "low"
+
+    def test_recent_domain_with_mx_stays_suspicious(self):
+        # facade site + MX on a recent domain must NOT be cleared as legitimate
+        r = self._classify("daniei-fake.com",
+                            whois={"creation_date": "2025-10-18T00:00:00"},
+                            dns={"records": {"A": ["1.2.3.4"], "MX": ["10 eforward1.registrar-servers.com"]}},
+                            http={"checks": [{"status_code": 200, "content_length": 8000}]})
+        assert r["auto_classification"] == "suspicious"
+
+    def test_old_domain_recently_reregistered_needs_review(self):
+        # created long ago but updated recently → possible drop-catch, don't clear
+        from datetime import datetime, timedelta
+        recent = (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%dT00:00:00")
+        r = self._classify("dropcatch.com",
+                            whois={"creation_date": "2010-01-01T00:00:00", "updated_date": recent},
+                            dns={"records": {"A": ["1.2.3.4"]}})
+        assert r["auto_classification"] == "needs_review"
+        assert r["rule"] == "old_domain_recently_updated"
+
+    def test_recent_inert_domain_still_needs_review(self):
+        # recent, no records worth a rule → stays needs_review (not auto-cleared)
+        r = self._classify("newthing.com",
+                            whois={"creation_date": "2026-05-01T00:00:00"},
+                            dns={"records": {}})
+        assert r["auto_classification"] == "needs_review"
+
+
+class TestClassifierRobustness:
+    """Bug hunt findings: the classifier must not crash on malformed/partial input
+    (WHOIS list-dates, future dates, None sub-objects) which occur with real data."""
+
+    def _post(self, payload):
+        return client.post("/classify/variant", json=payload)
+
+    def test_whois_list_date_handled(self):
+        # python-whois often returns creation_date as a LIST — must use earliest
+        from services.classifier import _domain_age
+        r = _domain_age({"creation_date": ["2019-10-09", "2019-10-10"]})
+        assert r["age_days"] is not None
+        assert r["created"] == "2019-10-09"
+
+    def test_future_creation_date_clamped(self):
+        from services.classifier import _domain_age
+        r = _domain_age({"creation_date": "2050-01-01T00:00:00"})
+        assert r["age_days"] is None  # not a negative number
+
+    def test_none_records_no_crash(self):
+        assert self._post({"domain": "x.com", "dns": {"records": None}}).status_code == 200
+
+    def test_none_checks_no_crash(self):
+        assert self._post({"domain": "x.com", "http": {"checks": None}}).status_code == 200
+
+    def test_none_in_checks_list_no_crash(self):
+        assert self._post({"domain": "x.com", "http": {"checks": [None]}}).status_code == 200
+
+    def test_none_cert_certificates_no_crash(self):
+        assert self._post({"domain": "x.com", "cert": {"ct_certificates": None}}).status_code == 200
+
+    def test_all_none_sub_objects(self):
+        r = self._post({"domain": "x.com", "dns": None, "http": None,
+                        "cert": None, "whois": None})
+        assert r.status_code == 200
+        assert "auto_classification" in r.json()
+
+
+class TestClassifierSecurity:
+    """Security audit: WHOIS data is attacker-controlled (registrant sets their own
+    record). Parsing it must resist DoS, log injection, and type confusion."""
+
+    def test_huge_list_no_dos(self):
+        # a hostile WHOIS returning a giant date list must be bounded
+        import time
+        from services.classifier import _domain_age
+        t0 = time.time()
+        r = _domain_age({"creation_date": ["2019-01-01"] * 100000})
+        assert (time.time() - t0) < 0.2  # bounded, not O(n) over 100k
+        assert r["created"] == "2019-01-01"
+
+    def test_huge_string_no_dos(self):
+        from services.classifier import _domain_age
+        r = _domain_age({"creation_date": "2019-" + "0" * 100000})
+        assert r["age_days"] is None  # junk, safely rejected
+
+    def test_newline_not_in_output(self):
+        # log-injection payload in a date must never reach the formatted output
+        from services.classifier import _domain_age
+        r = _domain_age({"creation_date": "2019-01-01\n\n\nFAKE LOG LINE"})
+        assert r["created"] == "2019-01-01"
+        assert "\n" not in (r["created"] or "")
+
+    def test_non_string_date_types_rejected(self):
+        from services.classifier import _domain_age
+        for bad in [{"evil": "x"}, b"2019-01-01", [["2019"]], 10**100]:
+            r = _domain_age({"creation_date": bad})
+            assert r["age_days"] is None
+
+    def test_batch_size_capped(self):
+        big = {"variants": [{"domain": f"d{i}.com"} for i in range(1001)]}
+        assert client.post("/classify/batch", json=big).status_code == 422
