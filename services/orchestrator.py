@@ -53,6 +53,9 @@ CLASSIFICATION_SEVERITY = {
 
 TIMEOUT = int(os.environ.get("SERVICE_TIMEOUT", "45"))
 PIPELINE_MAX_DURATION = int(os.environ.get("PIPELINE_MAX_DURATION", "7200"))  # 2h max
+# If the pipeline's heartbeat stops advancing for this long, consider it dead and allow
+# a new run. Covers crashes/kills that skip the normal cleanup. Default 10 minutes.
+HEARTBEAT_STALE_SEC = int(os.environ.get("HEARTBEAT_STALE_SEC", "600"))
 
 _lock = threading.Lock()
 _running = False
@@ -75,19 +78,25 @@ _progress = {
     "events": 0,
 }
 _log_buffer = []
+_last_heartbeat = 0.0  # monotonic time of the last progress update; detects dead pipelines
 
 def _progress_set(**kw):
-    """Thread-safe update of the progress state."""
+    """Thread-safe update of the progress state. Also bumps the heartbeat, so a
+    pipeline that stops making progress (crashed / killed) can be detected as stale."""
+    global _last_heartbeat
     with _lock:
         _progress.update(kw)
+        _last_heartbeat = time.time()
 
 def _progress_reset(client, total):
+    global _last_heartbeat
     with _lock:
         _progress.update({
             "running": True, "phase": "starting", "client": client or "all",
             "current_domain": None, "done": 0, "total": total,
             "started_at": now_iso(), "finished_at": None, "events": 0,
         })
+        _last_heartbeat = time.time()
         _log_buffer.clear()
 
 def _plog(msg):
@@ -173,14 +182,25 @@ def trigger(req: TriggerRequest, background_tasks: BackgroundTasks):
     """Triggera la pipeline in background."""
     global _running, _run_started
     with _lock:
-        # Reset se la pipeline è stale (durata > max)
-        if _running and (time.time() - _run_started) > PIPELINE_MAX_DURATION:
-            logger.warning("Pipeline stale, reset forzato")
-            _running = False
+        # A pipeline is considered STALE (and force-reset) if either:
+        #  - it has been running longer than the absolute max duration, or
+        #  - its heartbeat has not advanced for HEARTBEAT_STALE_SEC (it died in a way
+        #    that skipped the cleanup, e.g. OOM/SIGKILL/container crash).
         if _running:
+            elapsed = time.time() - _run_started
+            since_beat = time.time() - _last_heartbeat
+            if elapsed > PIPELINE_MAX_DURATION:
+                logger.warning(f"Pipeline stale (durata {elapsed:.0f}s), reset forzato")
+                _running = False
+            elif since_beat > HEARTBEAT_STALE_SEC:
+                logger.warning(f"Pipeline stale (nessun heartbeat da {since_beat:.0f}s), reset forzato")
+                _running = False
+        if _running:
+            since_beat = time.time() - _last_heartbeat
             return JSONResponse(status_code=409,
                                 content={"error": "Pipeline già in esecuzione",
-                                         "running_since": _run_started})
+                                         "running_since": _run_started,
+                                         "seconds_since_heartbeat": round(since_beat, 1)})
         _running = True
         _run_started = time.time()
 
@@ -188,6 +208,28 @@ def trigger(req: TriggerRequest, background_tasks: BackgroundTasks):
     return {"status": "triggered", "client": req.client or "all",
             "scope": req.scope, "dnstwist": req.include_dnstwist,
             "variant_intel": req.variant_intel, "timestamp": now_iso()}
+
+
+@router.post("/trigger/reset", tags=["Pipeline"])
+def trigger_reset():
+    """Force-release the pipeline lock.
+
+    Escape hatch for when a pipeline died in a way that skipped cleanup (OOM /
+    SIGKILL / container crash) and left `_running` stuck, blocking all new scans
+    with 409. The heartbeat check in /trigger auto-recovers after HEARTBEAT_STALE_SEC,
+    but this lets an operator unblock immediately without restarting the service.
+    Follows the orchestrator's network-isolation model (no app-level auth; reachable
+    only from the internal network / dashboard)."""
+    global _running
+    was_running = _running
+    since_beat = time.time() - _last_heartbeat if was_running else 0
+    with _lock:
+        _running = False
+        _progress.update({"running": False, "phase": "idle"})
+    logger.warning(f"Pipeline lock reset manuale (era running={was_running}, "
+                   f"ultimo heartbeat {since_beat:.0f}s fa)")
+    return {"status": "reset", "was_running": was_running,
+            "seconds_since_heartbeat": round(since_beat, 1), "timestamp": now_iso()}
 
 
 def _persist_intel(client: str, domain: str, legitimate: str, intel: dict):

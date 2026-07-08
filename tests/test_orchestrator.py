@@ -140,3 +140,43 @@ class TestDnstwistDedup:
         ]
         # only targets drive dnstwist; still dedups to the one legit
         assert self._distinct_legits(domains) == ["acme.com"]
+
+
+class TestPipelineLockRecovery:
+    """A pipeline that dies without cleanup (OOM/SIGKILL/crash) must not block all
+    future scans forever. Heartbeat staleness auto-recovers; a manual reset exists too."""
+
+    def _client(self):
+        import services.orchestrator as o
+        from fastapi.testclient import TestClient
+        return o, TestClient(o.app)
+
+    def test_stale_heartbeat_allows_new_run(self):
+        import time
+        o, c = self._client()
+        o._running = True
+        o._run_started = time.time() - 100
+        o._last_heartbeat = time.time() - (o.HEARTBEAT_STALE_SEC + 60)
+        r = c.post("/trigger", json={"client": "X"})
+        assert r.status_code == 200  # auto-reset, not blocked
+        o._running = False
+
+    def test_fresh_heartbeat_still_blocks(self):
+        import time
+        o, c = self._client()
+        o._running = True
+        o._run_started = time.time() - 100
+        o._last_heartbeat = time.time() - 30  # alive
+        r = c.post("/trigger", json={"client": "X"})
+        assert r.status_code == 409
+        o._running = False
+
+    def test_manual_reset_unblocks(self):
+        import time
+        o, c = self._client()
+        o._running = True
+        o._last_heartbeat = time.time() - 30
+        r = c.post("/trigger/reset")
+        assert r.status_code == 200
+        assert r.json()["was_running"] is True
+        assert o._running is False

@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [4.18.3] - 2026-07-08
+
+### Fixed
+- **Pipeline lock could get stuck, blocking all scans with HTTP 409.** If a pipeline
+  died in a way that skipped cleanup (OOM, SIGKILL, container crash), the in-memory
+  `_running` flag stayed True and every new scan was rejected with 409 until the service
+  was restarted by hand. Found in production when onboarding a new client.
+
+### Added
+- **Heartbeat-based stale detection.** Pipeline progress now bumps a heartbeat; if it
+  stops advancing for `HEARTBEAT_STALE_SEC` (default 600s), the next `/trigger`
+  auto-recovers instead of blocking indefinitely. Far quicker than the existing 2h
+  absolute-duration reset.
+- **`POST /trigger/reset`** endpoint: operator escape hatch to release the pipeline lock
+  immediately without restarting the service. Follows the orchestrator network-isolation
+  model (no app-level auth; internal-only).
+- `/trigger` 409 responses now include `seconds_since_heartbeat` for diagnosis.
+- 3 regression tests.
+
 ## [4.18.2] - 2026-07-07
 
 ### Security
