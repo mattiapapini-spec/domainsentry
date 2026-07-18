@@ -28,7 +28,7 @@ from contextlib import contextmanager
 import requests
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, Header, Request
 from fastapi.responses import JSONResponse
-from shared.compat import BaseModel, field_validator
+from shared.compat import BaseModel, field_validator, Field
 
 from shared.security import apply_security, sanitize_error, sanitize_log_input
 from shared.auth import (hash_password, verify_password, generate_token,
@@ -53,6 +53,9 @@ SERVICE_PERMISSIONS = ["manage_cases", "view"]
 
 VALID_STATUSES = ["new", "in_progress", "closed_tp", "closed_fp", "closed_benign"]
 CLOSED_STATUSES = ["closed_tp", "closed_fp", "closed_benign"]
+
+# Ordering used to decide whether a re-scan escalates a closed case back into the queue.
+SEVERITY_RANK = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -133,6 +136,21 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_cases_client ON cases(client);
             CREATE INDEX IF NOT EXISTS idx_cases_assignee ON cases(assignee_id);
         """)
+
+        # ── Schema migrations (idempotent; safe on existing production DBs) ──
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(cases)").fetchall()}
+        if "severity_locked" not in cols:
+            # Marks a severity set by an analyst. Locked severities are never overwritten
+            # by automatic re-classification, so manual judgement survives re-scans.
+            conn.execute("ALTER TABLE cases ADD COLUMN severity_locked INTEGER NOT NULL DEFAULT 0")
+            logger.info("Migration: added cases.severity_locked")
+        if "pending_severity" not in cols:
+            # When the classifier disagrees upward with a manually set severity it does
+            # not overwrite it: it files a proposal the analyst can approve or reject.
+            conn.execute("ALTER TABLE cases ADD COLUMN pending_severity TEXT")
+            conn.execute("ALTER TABLE cases ADD COLUMN pending_severity_reason TEXT")
+            conn.execute("ALTER TABLE cases ADD COLUMN pending_severity_at TEXT")
+            logger.info("Migration: added cases.pending_severity fields")
 
         # Bootstrap admin
         count = conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
@@ -234,7 +252,7 @@ def health():
 # ═══════════════════════════════════════════════════════════════
 
 class LoginRequest(BaseModel):
-    username: str
+    username: str = Field(..., max_length=120)
     password: str
 
 
@@ -315,7 +333,7 @@ def me(user=Depends(get_current_user)):
 # ═══════════════════════════════════════════════════════════════
 
 class UserCreate(BaseModel):
-    username: str
+    username: str = Field(..., max_length=120)
     password: str
     role: str = "viewer"
     permissions: Optional[List[str]] = None  # override; defaults from role
@@ -484,12 +502,12 @@ def reset_password(user_id: int, req: PasswordReset, user=Depends(get_current_us
 # ═══════════════════════════════════════════════════════════════
 
 class CaseIngest(BaseModel):
-    domain: str
-    client: str
-    classification: Optional[str] = None
+    domain: str = Field(..., max_length=253)          # max DNS name length
+    client: str = Field(..., max_length=120)
+    classification: Optional[str] = Field(None, max_length=64)
     confidence: Optional[str] = None
     severity: Optional[str] = None
-    rationale: Optional[str] = None
+    rationale: Optional[str] = Field(None, max_length=2000)
 
 
 @router.post("/cases/ingest", tags=["Cases"])
@@ -498,11 +516,12 @@ def ingest_case(req: CaseIngest, user=Depends(require("manage_cases"))):
     Ingest an event into a case. Called by orchestrator/event-publisher or manually.
     - New domain → create case (status=new)
     - Open case → update classification
-    - Closed case → reopen only if new severity is CRITICAL
+    - Closed case → reopen only if the new severity is HIGHER than the recorded one
+      (a domain closed as benign that later arms itself must come back to the queue)
     """
     with get_db() as conn:
         existing = conn.execute(
-            "SELECT id, status FROM cases WHERE domain=? AND client=?",
+            "SELECT id, status, severity, severity_locked FROM cases WHERE domain=? AND client=?",
             (req.domain, req.client)
         ).fetchone()
 
@@ -518,13 +537,61 @@ def ingest_case(req: CaseIngest, user=Depends(require("manage_cases"))):
             return {"id": cid, "status": "new", "created": True}
 
         cid = existing["id"]
+        locked = bool(existing["severity_locked"])
         if existing["status"] in CLOSED_STATUSES:
-            if (req.severity or "").upper() == "CRITICAL":
-                conn.execute("UPDATE cases SET status='new', classification=?, severity=?, rationale=?, updated_at=? WHERE id=?",
-                             (req.classification, req.severity, req.rationale, _now(), cid))
-                _audit(conn, cid, user["id"], "reopened", "auto-reopened: CRITICAL activity after closure")
-                return {"id": cid, "status": "new", "reopened": True}
+            old_sev = (existing["severity"] or "").upper()
+            new_sev = (req.severity or "").upper()
+            # Escalation only: re-open when the threat level actually grew. A closed
+            # case that re-classifies at the same or a lower severity stays closed, so
+            # routine re-scans don't undo the analyst's triage.
+            # If the stored severity is unknown, assume MEDIUM (the system-wide default)
+            # rather than 0, otherwise any LOW finding would reopen the case.
+            old_rank = SEVERITY_RANK.get(old_sev, SEVERITY_RANK["MEDIUM"])
+            new_rank = SEVERITY_RANK.get(new_sev, 0)
+            if new_rank > old_rank:
+                # A manually set severity is preserved even here: the case comes back
+                # into the queue (that's the point), but the analyst's rating stands and
+                # a proposal is filed for them to approve or reject.
+                if locked:
+                    conn.execute("UPDATE cases SET status='new', classification=?, confidence=?, rationale=?, "
+                                 "pending_severity=?, pending_severity_reason=?, pending_severity_at=?, updated_at=? WHERE id=?",
+                                 (req.classification, req.confidence, req.rationale,
+                                  new_sev, req.rationale, _now(), _now(), cid))
+                    _audit(conn, cid, user["id"], "severity_proposed",
+                           f"il classificatore propone {old_sev} → {new_sev} "
+                           f"(severità manuale mantenuta, in attesa di approvazione)")
+                    return {"id": cid, "status": "new", "reopened": True,
+                            "escalated_from": old_sev, "escalated_to": new_sev,
+                            "severity_locked": True, "severity_proposed": new_sev}
+                conn.execute("UPDATE cases SET status='new', classification=?, confidence=?, severity=?, rationale=?, updated_at=? WHERE id=?",
+                             (req.classification, req.confidence, req.severity, req.rationale, _now(), cid))
+                _audit(conn, cid, user["id"], "reopened",
+                       f"auto-reopened: severity escalated {old_sev or 'n/a'} → {new_sev}")
+                return {"id": cid, "status": "new", "reopened": True,
+                        "escalated_from": old_sev, "escalated_to": new_sev}
             return {"id": cid, "status": existing["status"], "updated": False}
+
+        if locked:
+            # Manual severity stands; everything else still refreshes. If the classifier
+            # now rates the domain HIGHER than the analyst did, file a proposal instead of
+            # silently discarding it, so the disagreement is visible and actionable.
+            old_rank = SEVERITY_RANK.get((existing["severity"] or "").upper(),
+                                         SEVERITY_RANK["MEDIUM"])
+            new_sev = (req.severity or "").upper()
+            if SEVERITY_RANK.get(new_sev, 0) > old_rank:
+                conn.execute("UPDATE cases SET classification=?, confidence=?, rationale=?, "
+                             "pending_severity=?, pending_severity_reason=?, pending_severity_at=?, updated_at=? WHERE id=?",
+                             (req.classification, req.confidence, req.rationale,
+                              new_sev, req.rationale, _now(), _now(), cid))
+                _audit(conn, cid, user["id"], "severity_proposed",
+                       f"il classificatore propone {existing['severity'] or 'n/a'} → {new_sev} "
+                       f"(in attesa di approvazione)")
+                return {"id": cid, "status": existing["status"], "updated": True,
+                        "severity_locked": True, "severity_proposed": new_sev}
+            conn.execute("UPDATE cases SET classification=?, confidence=?, rationale=?, updated_at=? WHERE id=?",
+                         (req.classification, req.confidence, req.rationale, _now(), cid))
+            return {"id": cid, "status": existing["status"], "updated": True,
+                    "severity_locked": True}
 
         conn.execute("UPDATE cases SET classification=?, confidence=?, severity=?, rationale=?, updated_at=? WHERE id=?",
                      (req.classification, req.confidence, req.severity, req.rationale, _now(), cid))
@@ -595,6 +662,101 @@ def update_status(case_id: int, req: StatusUpdate, user=Depends(require("manage_
     return {"id": case_id, "status": req.status}
 
 
+class SeverityUpdate(BaseModel):
+    # None releases the manual override and lets automatic classification resume.
+    severity: Optional[str] = None
+    reason: Optional[str] = Field(None, max_length=1000)
+
+    @field_validator("severity")
+    @classmethod
+    def valid(cls, v):
+        if v is None:
+            return v
+        v = v.upper()
+        if v not in SEVERITY_RANK:
+            raise ValueError(f"Severity must be one of: {', '.join(SEVERITY_RANK)}")
+        return v
+
+
+@router.patch("/cases/{case_id}/severity", tags=["Cases"])
+def update_severity(case_id: int, req: SeverityUpdate, user=Depends(require("manage_cases"))):
+    """Set the severity by hand, overriding automatic classification.
+
+    A manually set severity is *locked*: later re-scans update the classification and
+    rationale but leave the severity alone, so an analyst's judgement is not silently
+    reverted by the classifier. Send severity=null to release the lock and let automatic
+    classification take over again at the next scan."""
+    with get_db() as conn:
+        row = conn.execute("SELECT severity, severity_locked FROM cases WHERE id=?",
+                           (case_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Case not found")
+
+        if req.severity is None:
+            conn.execute("UPDATE cases SET severity_locked=0, "
+                         "pending_severity=NULL, pending_severity_reason=NULL, pending_severity_at=NULL, "
+                         "updated_at=? WHERE id=?",
+                         (_now(), case_id))
+            _audit(conn, case_id, user["id"], "severity_unlocked",
+                   "override rimosso, torna alla classificazione automatica")
+            return {"id": case_id, "severity": row["severity"], "locked": False}
+
+        detail = f"{row['severity'] or 'n/a'} → {req.severity} (manuale)"
+        if req.reason:
+            detail += f": {sanitize_log_input(req.reason)}"
+        # Setting severity by hand is a fresh analyst decision: it supersedes and clears
+        # any pending classifier proposal, so the case doesn't keep showing a stale one.
+        conn.execute("UPDATE cases SET severity=?, severity_locked=1, "
+                     "pending_severity=NULL, pending_severity_reason=NULL, pending_severity_at=NULL, "
+                     "updated_at=? WHERE id=?",
+                     (req.severity, _now(), case_id))
+        _audit(conn, case_id, user["id"], "severity_changed", detail)
+    return {"id": case_id, "severity": req.severity, "locked": True}
+
+
+class SeverityProposalAction(BaseModel):
+    action: str  # approve | reject
+
+    @field_validator("action")
+    @classmethod
+    def valid(cls, v):
+        if v not in ("approve", "reject"):
+            raise ValueError("Action must be 'approve' or 'reject'")
+        return v
+
+
+@router.post("/cases/{case_id}/severity/proposal", tags=["Cases"])
+def resolve_severity_proposal(case_id: int, req: SeverityProposalAction,
+                              user=Depends(require("manage_cases"))):
+    """Approve or reject the severity the classifier proposed for a case whose severity
+    was set manually. Approving adopts the proposed severity (and keeps it locked, since
+    it is now an analyst decision); rejecting keeps the current severity. Either way the
+    proposal is cleared and the outcome is recorded in the audit trail."""
+    with get_db() as conn:
+        row = conn.execute("SELECT severity, pending_severity FROM cases WHERE id=?",
+                           (case_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Case not found")
+        if not row["pending_severity"]:
+            raise HTTPException(400, "No pending severity proposal for this case")
+
+        proposed = row["pending_severity"]
+        current = row["severity"]
+        if req.action == "approve":
+            conn.execute("UPDATE cases SET severity=?, severity_locked=1, pending_severity=NULL, "
+                         "pending_severity_reason=NULL, pending_severity_at=NULL, updated_at=? WHERE id=?",
+                         (proposed, _now(), case_id))
+            _audit(conn, case_id, user["id"], "severity_proposal_approved",
+                   f"{current or 'n/a'} → {proposed} (proposta del classificatore accettata)")
+            return {"id": case_id, "severity": proposed, "approved": True}
+
+        conn.execute("UPDATE cases SET pending_severity=NULL, pending_severity_reason=NULL, "
+                     "pending_severity_at=NULL, updated_at=? WHERE id=?", (_now(), case_id))
+        _audit(conn, case_id, user["id"], "severity_proposal_rejected",
+               f"proposta {proposed} rifiutata, resta {current or 'n/a'}")
+    return {"id": case_id, "severity": current, "approved": False}
+
+
 class AssignRequest(BaseModel):
     assignee_id: Optional[int]  # None to unassign
 
@@ -620,7 +782,7 @@ def assign_case(case_id: int, req: AssignRequest, user=Depends(require("assign_c
 
 
 class NoteRequest(BaseModel):
-    note: str
+    note: str = Field(..., max_length=5000)
 
     @field_validator("note")
     @classmethod
@@ -646,7 +808,7 @@ def add_note(case_id: int, req: NoteRequest, user=Depends(require("add_notes")))
 
 
 class WhitelistRequest(BaseModel):
-    reason: str
+    reason: str = Field(..., max_length=1000)
 
     @field_validator("reason")
     @classmethod

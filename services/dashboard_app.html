@@ -282,6 +282,14 @@
   .empty { padding: 54px; text-align: center; color: var(--text-faint); font-family: var(--mono); letter-spacing: .05em; }
 
   /* ── Badges (neon) ── */
+  .sev-pending { display:inline-block; width:16px; height:16px; line-height:15px; text-align:center;
+    border-radius:50%; background:var(--amber); color:#12100a; font-weight:800; font-size:11px;
+    font-family:var(--mono); cursor:help; }
+  .prop-banner { border:1px solid var(--amber); border-radius:6px; padding:12px 14px; margin:12px 0;
+    background:rgba(255,176,32,.07); }
+  .prop-banner .pb-title { color:var(--amber); font-family:var(--mono); font-size:12px;
+    letter-spacing:.06em; margin-bottom:6px; }
+  .prop-banner .pb-actions { display:flex; gap:8px; margin-top:10px; }
   .badge { display: inline-block; padding: 2px 9px; border-radius: 3px; font-size: 10.5px; font-weight: 600; border: 1px solid transparent; white-space: nowrap; font-family: var(--mono); letter-spacing: .04em; }
   .sev-CRITICAL { color: var(--crit); border-color: var(--crit); background: rgba(255,46,99,.1); text-shadow: 0 0 6px rgba(255,46,99,.6); box-shadow: 0 0 7px rgba(255,46,99,.2); }
   .sev-HIGH { color: var(--high); border-color: var(--high); background: rgba(255,140,26,.1); text-shadow: 0 0 6px rgba(255,140,26,.5); }
@@ -423,7 +431,7 @@
           <option value="watchlist">Watchlist only</option>
         </select>
         <label class="run-check" style="margin-top:14px"><input type="checkbox" id="run-twist"> Include dnstwist <span class="muted">(slower — discovers new variants)</span></label>
-        <label class="run-check" id="run-vintel-row" style="display:none"><input type="checkbox" id="run-vintel"> Collect full intel on variants <span class="muted">(DNS/MX/site/cert for each — needed to triage tp/fp)</span></label>
+        <label class="run-check" id="run-vintel-row" style="display:none"><input type="checkbox" id="run-vintel"> Collect full intel on variants <span class="muted">(DNS/MX/site/cert/WHOIS for each — required for auto-classification; without it variants stay needs_review)</span></label>
         <div class="run-note muted" id="run-note">A scan takes ~100s per client; with dnstwist, several minutes. Collecting variant intel adds time per registered variant. Cases appear automatically when it finishes.</div>
         <button class="btn btn-primary btn-full" id="run-go" onclick="launchScan()">Launch scan</button>
       </div>
@@ -1478,7 +1486,7 @@ function rowHtml(c) {
       <td class="domain">${esc(c.domain)}</td>
       <td class="muted">${esc(c.client)}</td>
       <td>${esc(c.classification || "—")}</td>
-      <td>${sevBadge(c.severity)}</td>
+      <td>${sevBadge(c.severity)}${c.severity_locked ? ' <span class="muted" title="severity set manually by an analyst">\u25c9</span>' : ''}${c.pending_severity ? ` <span class="sev-pending" title="classifier proposes ${esc(c.pending_severity)} — needs your review">!</span>` : ''}</td>
       <td>${stBadge(c.status)}</td>
       <td class="muted">${esc(c.assignee_name || "—")}</td>
       <td class="muted">${fmtDate(c.updated_at)}</td>
@@ -1575,6 +1583,20 @@ function renderDrawer(d) {
   const c = d.case;
   const isClosed = c.status.startsWith("closed_");
 
+  let proposal = "";
+  if (c.pending_severity) {
+    proposal = `<div class="prop-banner">
+      <div class="pb-title">! SEVERITY PROPOSED BY CLASSIFIER</div>
+      <div>The latest scan rates this domain <strong>${esc(c.pending_severity)}</strong>,
+      higher than the <strong>${esc(c.severity || "n/a")}</strong> you set manually.</div>
+      ${c.pending_severity_reason ? `<div class="muted" style="margin-top:6px">${esc(c.pending_severity_reason)}</div>` : ""}
+      ${can("manage_cases") ? `<div class="pb-actions">
+        <button class="btn btn-sm" onclick="resolveProposal(${c.id},'approve')">Accept ${esc(c.pending_severity)}</button>
+        <button class="btn btn-sm" onclick="resolveProposal(${c.id},'reject')">Keep ${esc(c.severity || "current")}</button>
+      </div>` : ""}
+    </div>`;
+  }
+
   let actions = "";
   if (!isClosed && (can("manage_cases") || can("assign_cases") || can("whitelist") || can("add_notes"))) {
     actions += '<div class="block-title">Actions</div>';
@@ -1596,6 +1618,17 @@ function renderDrawer(d) {
           <option value="closed_benign">Close — Benign</option>
         </select>
         <button class="btn btn-sm" onclick="doStatus(${c.id})">Update</button>
+      </div>`;
+    }
+    if (can("manage_cases")) {
+      const sevLocked = !!c.severity_locked;
+      const sevOpts = ["LOW","MEDIUM","HIGH","CRITICAL"]
+        .map(s => `<option value="${s}" ${c.severity===s?"selected":""}>${s}</option>`).join("");
+      actions += `<div class="action-row">
+        <select id="a-severity">${sevOpts}</select>
+        <button class="btn btn-sm" onclick="doSeverity(${c.id})" title="Override the automatic severity; it will not be changed by future scans">Set severity</button>
+        ${sevLocked ? `<button class="btn btn-sm" onclick="doSeverityAuto(${c.id})" title="Release the manual override and follow automatic classification again">↺ Back to auto</button>` : ""}
+        ${sevLocked ? '<span class="muted">manual override active</span>' : ''}
       </div>`;
     }
     if (can("whitelist")) {
@@ -1644,6 +1677,7 @@ function renderDrawer(d) {
         <dt>Updated</dt><dd>${fmtDate(c.updated_at)}</dd>
       </dl>
       ${c.rationale ? `<div class="rationale">${esc(c.rationale)}</div>` : ""}
+      ${proposal}
       ${actions}
       <div class="block-title">Notes</div>
       ${notes}
@@ -1853,6 +1887,26 @@ async function doStatus(id) {
   try {
     await api(`/cases/${id}/status`, { method: "PATCH", body: JSON.stringify({ status: v }) });
     toast("status updated", "ok"); refreshAfter(id);
+  } catch (e) { toast(e.message, "bad"); }
+}
+async function doSeverity(id) {
+  const v = $("a-severity").value;
+  try {
+    await api(`/cases/${id}/severity`, { method: "PATCH", body: JSON.stringify({ severity: v }) });
+    toast(`severity set to ${v} (manual)`, "ok"); refreshAfter(id);
+  } catch (e) { toast(e.message, "bad"); }
+}
+async function resolveProposal(id, action) {
+  try {
+    const r = await api(`/cases/${id}/severity/proposal`, { method: "POST", body: JSON.stringify({ action }) });
+    toast(action === "approve" ? `severity updated to ${r.severity}` : "proposal rejected", "ok");
+    refreshAfter(id);
+  } catch (e) { toast(e.message, "bad"); }
+}
+async function doSeverityAuto(id) {
+  try {
+    await api(`/cases/${id}/severity`, { method: "PATCH", body: JSON.stringify({ severity: null }) });
+    toast("severity back to automatic", "ok"); refreshAfter(id);
   } catch (e) { toast(e.message, "bad"); }
 }
 async function reopenCase(id) {

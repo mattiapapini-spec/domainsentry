@@ -12,7 +12,7 @@ Usage in services:
 """
 
 import pydantic
-from pydantic import BaseModel
+from pydantic import BaseModel, Field  # noqa: F401  (Field exists in v1 and v2)
 
 _PYDANTIC_V2 = pydantic.VERSION.startswith("2")
 

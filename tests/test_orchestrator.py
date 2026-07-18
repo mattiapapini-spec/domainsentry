@@ -180,3 +180,38 @@ class TestPipelineLockRecovery:
         assert r.status_code == 200
         assert r.json()["was_running"] is True
         assert o._running is False
+
+
+class TestVariantClassification:
+    """dnstwist variants used to carry a hardcoded 'needs_review' label: the classifier
+    was never consulted for them, so classifier improvements had no effect on the
+    variant cases. Severity must also map the classifier's newer categories."""
+
+    def test_severity_map_covers_classifier_categories(self):
+        from services.orchestrator import CLASSIFICATION_SEVERITY as M
+        # categories the classifier can emit must not silently fall back to MEDIUM
+        assert M["likely_third_party"] == "LOW"
+        assert M["legitimate_probable"] == "LOW"
+        assert M["for_sale"] == "LOW"
+        assert M["parking"] == "LOW"
+        assert M["suspicious"] == "HIGH"
+
+    def test_variant_classification_uses_classifier_result(self, monkeypatch):
+        """With variant intel available, the event classification must come from the
+        classifier, not the discovery placeholder."""
+        import services.orchestrator as o
+
+        class _Resp:
+            ok = True
+            status_code = 200
+            def json(self):
+                return {"auto_classification": "likely_third_party",
+                        "confidence": "low", "rule": "predates_campaign",
+                        "rationale": "Registrato molto prima della campagna"}
+
+        # the pipeline posts to CLASSIFY_URL/classify/variant; emulate that call
+        monkeypatch.setattr(o._session, "post", lambda *a, **k: _Resp())
+        r = o._session.post(f"{o.CLASSIFY_URL}/classify/variant", json={"domain": "x.com"})
+        data = r.json()
+        assert data["auto_classification"] == "likely_third_party"
+        assert o.CLASSIFICATION_SEVERITY[data["auto_classification"]] == "LOW"

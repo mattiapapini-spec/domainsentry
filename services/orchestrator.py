@@ -49,6 +49,7 @@ CLASSIFICATION_SEVERITY = {
     "redirect-kit": "HIGH", "redirect-chain": "HIGH", "suspicious": "HIGH",
     "needs_review": "MEDIUM", "mx_only": "MEDIUM",
     "parking": "LOW", "inactive": "LOW", "benign": "LOW", "legitimate": "LOW",
+    "legitimate_probable": "LOW", "likely_third_party": "LOW", "for_sale": "LOW",
 }
 
 TIMEOUT = int(os.environ.get("SERVICE_TIMEOUT", "45"))
@@ -459,6 +460,31 @@ def _run_pipeline(req: TriggerRequest):
                                             "cert_count": vcert.get("total", 0),
                                             "intel_collected": True,
                                         })
+                                        # Now that we have real intel (incl. WHOIS), let the
+                                        # classifier decide instead of leaving the placeholder
+                                        # "needs_review" from discovery. This is what applies the
+                                        # domain-age rule and the parking/for-sale/threat rules to
+                                        # dnstwist variants.
+                                        try:
+                                            vcr = _session.post(f"{CLASSIFY_URL}/classify/variant", json={
+                                                "domain": vdomain,
+                                                "fuzzer": variant.get("fuzzer", ""),
+                                                "dns": vintel.get("dns"), "cert": vintel.get("cert"),
+                                                "http": vintel.get("http"), "whois": vintel.get("whois"),
+                                                "reputation": vintel.get("reputation"),
+                                            }, timeout=TIMEOUT)
+                                            if vcr.ok:
+                                                vcls = vcr.json()
+                                                event["classification"] = {
+                                                    "auto_classification": vcls.get("auto_classification", "needs_review"),
+                                                    "rule": vcls.get("rule", "dnstwist_discovery"),
+                                                    "confidence": vcls.get("confidence", "low"),
+                                                    "rationale": vcls.get("rationale") or
+                                                                 f"Variante {variant.get('fuzzer','')} di {legit}",
+                                                }
+                                        except Exception as e:
+                                            logger.warning(f"    [TWIST-CLASSIFY] {sanitize_log_input(vdomain)} "
+                                                           f"error: {sanitize_log_input(str(e))}")
                                     except Exception as e:
                                         logger.warning(f"    [TWIST-INTEL] {sanitize_log_input(vdomain)} error: {sanitize_log_input(str(e))}")
 

@@ -486,3 +486,266 @@ class TestLoginRateLimit:
         finally:
             cm.LOGIN_MAX_FAILURES = orig
             cm._login_failures.clear()
+
+
+class TestClosedCaseEscalation:
+    """A closed case must come back into the queue only when a re-scan reports a
+    HIGHER severity than the one recorded. Routine re-scans at equal or lower
+    severity must not undo the analyst's triage."""
+
+    def _tok(self):
+        return _login("admin", "admin_password_123").json()["token"]
+
+    def _ingest(self, domain, severity, token):
+        return client.post("/cases/ingest", headers=_auth_header(token), json={
+            "domain": domain, "client": "EscTest", "classification": "needs_review",
+            "confidence": "low", "severity": severity, "rationale": "test",
+        }).json()
+
+    def _close(self, cid, token):
+        return client.patch(f"/cases/{cid}/status", headers=_auth_header(token),
+                            json={"status": "closed_fp"}).status_code
+
+    def test_higher_severity_reopens(self):
+        t = self._tok()
+        cid = self._ingest("esc-up.com", "LOW", t)["id"]
+        assert self._close(cid, t) == 200
+        out = self._ingest("esc-up.com", "HIGH", t)
+        assert out.get("reopened") is True
+        assert out["status"] == "new"
+        assert out["escalated_from"] == "LOW"
+        assert out["escalated_to"] == "HIGH"
+
+    def test_equal_severity_stays_closed(self):
+        t = self._tok()
+        cid = self._ingest("esc-eq.com", "MEDIUM", t)["id"]
+        self._close(cid, t)
+        out = self._ingest("esc-eq.com", "MEDIUM", t)
+        assert out.get("reopened") is not True
+        assert out["status"] == "closed_fp"
+
+    def test_lower_severity_stays_closed(self):
+        t = self._tok()
+        cid = self._ingest("esc-down.com", "HIGH", t)["id"]
+        self._close(cid, t)
+        out = self._ingest("esc-down.com", "LOW", t)
+        assert out.get("reopened") is not True
+        assert out["status"] == "closed_fp"
+
+    def test_open_case_never_reverts_to_new(self):
+        # an in-progress case keeps its status when re-ingested
+        t = self._tok()
+        cid = self._ingest("esc-open.com", "LOW", t)["id"]
+        client.patch(f"/cases/{cid}/status", headers=_auth_header(t),
+                     json={"status": "in_progress"})
+        out = self._ingest("esc-open.com", "HIGH", t)
+        assert out["status"] == "in_progress"
+        assert out.get("updated") is True
+
+
+class TestManualSeverity:
+    """An analyst can override the automatic severity. A manual severity is locked:
+    re-scans refresh classification/rationale but must not revert the analyst's rating."""
+
+    def _tok(self):
+        return _login("admin", "admin_password_123").json()["token"]
+
+    def _ingest(self, domain, severity, token, classification="parking"):
+        return client.post("/cases/ingest", headers=_auth_header(token), json={
+            "domain": domain, "client": "SevTest", "classification": classification,
+            "confidence": "low", "severity": severity, "rationale": "auto",
+        }).json()
+
+    def _get(self, cid, token):
+        return client.get(f"/cases/{cid}", headers=_auth_header(token)).json()["case"]
+
+    def test_set_severity_manually(self):
+        t = self._tok()
+        cid = self._ingest("sev-set.com", "LOW", t)["id"]
+        r = client.patch(f"/cases/{cid}/severity", headers=_auth_header(t),
+                         json={"severity": "HIGH", "reason": "confermato a mano"})
+        assert r.status_code == 200
+        assert r.json()["locked"] is True
+        assert self._get(cid, t)["severity"] == "HIGH"
+
+    def test_rescan_does_not_override_manual_severity(self):
+        t = self._tok()
+        cid = self._ingest("sev-keep.com", "LOW", t)["id"]
+        client.patch(f"/cases/{cid}/severity", headers=_auth_header(t),
+                     json={"severity": "HIGH"})
+        self._ingest("sev-keep.com", "LOW", t, classification="legitimate_probable")
+        c = self._get(cid, t)
+        assert c["severity"] == "HIGH"           # analyst rating preserved
+        assert c["classification"] == "legitimate_probable"  # rest still refreshed
+
+    def test_release_override_restores_automatic(self):
+        t = self._tok()
+        cid = self._ingest("sev-auto.com", "LOW", t)["id"]
+        client.patch(f"/cases/{cid}/severity", headers=_auth_header(t), json={"severity": "HIGH"})
+        client.patch(f"/cases/{cid}/severity", headers=_auth_header(t), json={"severity": None})
+        self._ingest("sev-auto.com", "LOW", t)
+        c = self._get(cid, t)
+        assert c["severity"] == "LOW"
+        assert not c["severity_locked"]
+
+    def test_invalid_severity_rejected(self):
+        t = self._tok()
+        cid = self._ingest("sev-bad.com", "LOW", t)["id"]
+        r = client.patch(f"/cases/{cid}/severity", headers=_auth_header(t),
+                         json={"severity": "URGENTISSIMO"})
+        assert r.status_code == 422
+
+    def test_severity_change_is_audited(self):
+        t = self._tok()
+        cid = self._ingest("sev-audit.com", "LOW", t)["id"]
+        client.patch(f"/cases/{cid}/severity", headers=_auth_header(t),
+                     json={"severity": "CRITICAL", "reason": "phishing attivo"})
+        hist = client.get(f"/cases/{cid}", headers=_auth_header(t)).json().get("history", [])
+        assert any(h["action"] == "severity_changed" for h in hist)
+
+
+class TestSeverityProposal:
+    """When the classifier rates a case HIGHER than the analyst's manual severity it
+    must not silently discard the finding: it files a proposal the analyst can approve
+    or reject, surfaced in the dashboard."""
+
+    def _tok(self):
+        return _login("admin", "admin_password_123").json()["token"]
+
+    def _ingest(self, domain, severity, token, classification="parking"):
+        return client.post("/cases/ingest", headers=_auth_header(token), json={
+            "domain": domain, "client": "PropTest", "classification": classification,
+            "confidence": "low", "severity": severity, "rationale": "MX su dominio recente",
+        }).json()
+
+    def _get(self, cid, token):
+        return client.get(f"/cases/{cid}", headers=_auth_header(token)).json()["case"]
+
+    def _lock(self, cid, sev, token):
+        return client.patch(f"/cases/{cid}/severity", headers=_auth_header(token),
+                            json={"severity": sev})
+
+    def test_higher_classification_files_proposal(self):
+        t = self._tok()
+        cid = self._ingest("prop-1.com", "MEDIUM", t)["id"]
+        self._lock(cid, "LOW", t)
+        out = self._ingest("prop-1.com", "HIGH", t, classification="suspicious")
+        assert out.get("severity_proposed") == "HIGH"
+        c = self._get(cid, t)
+        assert c["severity"] == "LOW"            # analyst rating untouched
+        assert c["pending_severity"] == "HIGH"   # proposal visible
+
+    def test_lower_classification_files_no_proposal(self):
+        t = self._tok()
+        cid = self._ingest("prop-2.com", "MEDIUM", t)["id"]
+        self._lock(cid, "HIGH", t)
+        self._ingest("prop-2.com", "LOW", t)
+        assert self._get(cid, t)["pending_severity"] is None
+
+    def test_approve_adopts_proposed_severity(self):
+        t = self._tok()
+        cid = self._ingest("prop-3.com", "MEDIUM", t)["id"]
+        self._lock(cid, "LOW", t)
+        self._ingest("prop-3.com", "HIGH", t, classification="suspicious")
+        r = client.post(f"/cases/{cid}/severity/proposal", headers=_auth_header(t),
+                        json={"action": "approve"})
+        assert r.status_code == 200 and r.json()["approved"] is True
+        c = self._get(cid, t)
+        assert c["severity"] == "HIGH"
+        assert c["pending_severity"] is None
+        assert c["severity_locked"]  # remains an analyst decision
+
+    def test_reject_keeps_analyst_severity(self):
+        t = self._tok()
+        cid = self._ingest("prop-4.com", "MEDIUM", t)["id"]
+        self._lock(cid, "LOW", t)
+        self._ingest("prop-4.com", "HIGH", t, classification="suspicious")
+        r = client.post(f"/cases/{cid}/severity/proposal", headers=_auth_header(t),
+                        json={"action": "reject"})
+        assert r.status_code == 200 and r.json()["approved"] is False
+        c = self._get(cid, t)
+        assert c["severity"] == "LOW"
+        assert c["pending_severity"] is None
+
+    def test_resolve_without_proposal_is_400(self):
+        t = self._tok()
+        cid = self._ingest("prop-5.com", "MEDIUM", t)["id"]
+        r = client.post(f"/cases/{cid}/severity/proposal", headers=_auth_header(t),
+                        json={"action": "approve"})
+        assert r.status_code == 400
+
+    def test_invalid_action_rejected(self):
+        t = self._tok()
+        cid = self._ingest("prop-6.com", "MEDIUM", t)["id"]
+        r = client.post(f"/cases/{cid}/severity/proposal", headers=_auth_header(t),
+                        json={"action": "maybe"})
+        assert r.status_code == 422
+
+    def test_proposal_is_audited(self):
+        t = self._tok()
+        cid = self._ingest("prop-7.com", "MEDIUM", t)["id"]
+        self._lock(cid, "LOW", t)
+        self._ingest("prop-7.com", "HIGH", t, classification="suspicious")
+        client.post(f"/cases/{cid}/severity/proposal", headers=_auth_header(t),
+                    json={"action": "approve"})
+        hist = client.get(f"/cases/{cid}", headers=_auth_header(t)).json().get("history", [])
+        actions = {h["action"] for h in hist}
+        assert "severity_proposed" in actions
+        assert "severity_proposal_approved" in actions
+
+
+class TestInputLimitsAndProposalHygiene:
+    """Security/robustness hardening: input fields are length-bounded (no unbounded
+    writes to the DB), and a manual severity change clears any stale proposal."""
+
+    def _tok(self):
+        return _login("admin", "admin_password_123").json()["token"]
+
+    def _ingest(self, domain, severity, token, classification="parking", rationale="x"):
+        return client.post("/cases/ingest", headers=_auth_header(token), json={
+            "domain": domain, "client": "LimTest", "classification": classification,
+            "confidence": "low", "severity": severity, "rationale": rationale,
+        })
+
+    def test_huge_rationale_rejected(self):
+        t = self._tok()
+        r = self._ingest("lim1.com", "LOW", t, rationale="A" * 100000)
+        assert r.status_code == 422
+
+    def test_huge_domain_rejected(self):
+        t = self._tok()
+        r = self._ingest("A" * 100000 + ".com", "LOW", t)
+        assert r.status_code == 422
+
+    def test_huge_severity_reason_rejected(self):
+        t = self._tok()
+        cid = self._ingest("lim2.com", "MEDIUM", t).json()["id"]
+        r = client.patch(f"/cases/{cid}/severity", headers=_auth_header(t),
+                         json={"severity": "HIGH", "reason": "A" * 100000})
+        assert r.status_code == 422
+
+    def test_huge_note_rejected(self):
+        t = self._tok()
+        cid = self._ingest("lim3.com", "MEDIUM", t).json()["id"]
+        r = client.post(f"/cases/{cid}/notes", headers=_auth_header(t),
+                        json={"note": "A" * 100000})
+        assert r.status_code == 422
+
+    def test_normal_inputs_still_accepted(self):
+        t = self._tok()
+        cid = self._ingest("lim4.com", "MEDIUM", t, rationale="MX forwarding on recent domain").json()["id"]
+        assert client.patch(f"/cases/{cid}/severity", headers=_auth_header(t),
+                            json={"severity": "HIGH", "reason": "phishing confirmed"}).status_code == 200
+        assert client.post(f"/cases/{cid}/notes", headers=_auth_header(t),
+                           json={"note": "analyst note"}).status_code == 200
+
+    def test_manual_severity_clears_pending_proposal(self):
+        t = self._tok()
+        cid = self._ingest("lim5.com", "MEDIUM", t).json()["id"]
+        client.patch(f"/cases/{cid}/severity", headers=_auth_header(t), json={"severity": "LOW"})
+        self._ingest("lim5.com", "HIGH", t, classification="suspicious")  # files a proposal
+        # analyst now sets severity by hand → proposal must be cleared
+        client.patch(f"/cases/{cid}/severity", headers=_auth_header(t), json={"severity": "MEDIUM"})
+        c = client.get(f"/cases/{cid}", headers=_auth_header(t)).json()["case"]
+        assert c["pending_severity"] is None
+        assert c["severity"] == "MEDIUM"

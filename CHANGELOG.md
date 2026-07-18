@@ -2,6 +2,106 @@
 
 All notable changes to this project will be documented in this file.
 
+## [4.20.1] - 2026-07-18
+
+### Security / Fixed
+- **Bug hunt + security audit on the severity/proposal code (v4.19.0–4.20.0).**
+  - **Unbounded input fields**: no request field had a length limit, so an authenticated
+    caller (or the orchestrator with manipulated data) could write multi-megabyte values
+    into the DB via `rationale`, `reason`, `note`, `domain`, `client`, `username`
+    (storage abuse / DoS). All input models now enforce `max_length`; oversized payloads
+    get 422. Verified normal inputs still pass.
+  - **Orphaned proposal**: if a pending classifier proposal existed and the analyst then
+    set the severity by hand, the stale proposal kept showing in the UI. Setting or
+    releasing a manual severity now clears any pending proposal.
+  - Confirmed safe: proposal reason is HTML-escaped in the UI (no stored XSS);
+    `sanitize_log_input` strips newlines (no audit-log injection); migrations are
+    idempotent across repeated restarts (no duplicate columns); domain/client fields are
+    parameterized in SQL (injection attempt stored harmlessly, table intact).
+  - 6 regression tests.
+
+## [4.20.0] - 2026-07-18
+
+### Added
+- **Severity proposals: the classifier can ask, instead of being ignored.** When a re-scan
+  rates a case HIGHER than the severity an analyst set by hand, the finding is no longer
+  silently discarded (nor does it overwrite the analyst). A proposal is filed on the case
+  and must be explicitly approved or rejected:
+  - `POST /cases/{id}/severity/proposal` with `{"action": "approve" | "reject"}`.
+    Approving adopts the proposed severity and keeps it locked (it is now an analyst
+    decision); rejecting keeps the current severity. Either way the proposal is cleared.
+  - Dashboard: an amber **!** marker appears next to the severity in the case list, and
+    the case detail shows a banner explaining the disagreement with Accept / Keep buttons.
+  - Both the proposal and its resolution are recorded in the case audit trail.
+- Schema migration (idempotent) adds `cases.pending_severity`, `pending_severity_reason`,
+  `pending_severity_at`. Verified against both a pre-4.19 database and a 4.19 database:
+  columns added, existing cases preserved.
+- 7 regression tests.
+
+### Rationale
+Keeping a manual severity is right, but a classifier that later sees a domain arm itself
+should not lose that signal in the audit log. The proposal makes the disagreement visible
+and forces an explicit decision, without ever overriding the analyst automatically.
+
+## [4.19.0] - 2026-07-18
+
+### Added
+- **Manual severity override.** `PATCH /cases/{id}/severity` lets an analyst set a case
+  severity by hand when the automatic classification gets it wrong. A manually set
+  severity is *locked*: subsequent scans refresh classification, confidence and rationale
+  but leave the severity untouched, so analyst judgement is never silently reverted.
+  Send `severity: null` to release the override and follow automatic classification again.
+- Dashboard: severity selector with "Set severity" and "Back to auto" in the case actions,
+  plus a marker in the case list showing which severities were set by hand.
+- The override is recorded in the case audit trail, with the optional reason.
+- Schema migration (idempotent) adds `cases.severity_locked`; existing cases default to
+  automatic. Verified on a pre-migration database: column added, data preserved.
+- 5 regression tests.
+
+### Notes
+- A locked severity is also preserved when an escalation reopens a closed case: the case
+  returns to the queue (that is the point) but the analyst's rating stands, and the audit
+  records what the classifier saw.
+
+## [4.18.5] - 2026-07-18
+
+### Changed
+- **Closed cases now reopen on severity escalation, not only on CRITICAL.** Previously a
+  closed case came back into the queue only if a re-scan reported CRITICAL, a level the
+  classifier never emits: in practice a domain closed as benign that later armed itself
+  (e.g. re-classified `suspicious`/HIGH) stayed closed and silently out of sight. Reopening
+  is now relative: a case reopens when the new severity ranks higher than the one recorded,
+  and the audit trail records the transition (`severity escalated MEDIUM -> HIGH`).
+- Re-scans at equal or lower severity still leave closed cases untouched, so routine
+  scanning never undoes analyst triage. When a case has no recorded severity, MEDIUM is
+  assumed as the baseline so that LOW findings cannot reopen it.
+- Ingest response now returns `escalated_from` / `escalated_to` on reopen.
+- 4 regression tests. Verified against the Kedrion dataset: 0 of 14 closed cases would
+  reopen on the next scan.
+
+## [4.18.4] - 2026-07-18
+
+### Fixed
+- **dnstwist variants were never classified: every variant case was hardcoded to
+  `needs_review` / MEDIUM.** The orchestrator built variant events with a fixed
+  `auto_classification: "needs_review"` placeholder from discovery and never called the
+  classifier for them. The classifier was only consulted for monitored (target) domains,
+  so *all* classifier improvements (including the v4.18.0 domain-age rule) had no effect
+  on variant cases. Variants with collected intel are now sent to `/classify/variant` and
+  the real classification is used.
+- **Severity map was missing the classifier's newer categories** (`likely_third_party`,
+  `legitimate_probable`, `for_sale`), which silently fell back to MEDIUM. Now mapped to LOW.
+
+### Changed
+- Dashboard: the "Collect full intel on variants" option now states that it is required
+  for auto-classification (without WHOIS the age rule cannot run and variants stay
+  `needs_review`).
+- 2 regression tests.
+
+### Impact
+On the Kedrion dataset, variant classification goes from 24x `needs_review`/MEDIUM to
+2 HIGH (the confirmed threats), 5 MEDIUM, 13 LOW.
+
 ## [4.18.3] - 2026-07-08
 
 ### Fixed
