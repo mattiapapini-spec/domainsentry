@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [4.21.0] - 2026-07-19
+
+### Improved
+- **Domain age now modulates threat severity instead of acting only as a fallback.**
+  Measured on three real client datasets, the HIGH bucket was dominated by decades-old
+  legitimate businesses: 5/5 HIGH on one client were domains registered 2000-2008, and
+  8/10 on another. The cause was rule ordering: weak signals fired and returned HIGH
+  before the age rule was ever reached. Weak signals (`hidden_elements`, `mx_only_no_web`,
+  `privacy_mx_provider`, `forwarding_mx`) now downgrade to `needs_review`/MEDIUM on
+  domains older than `AGE_THIRD_PARTY_DAYS` (540), and alarm only on recent registrations.
+  Result on the same data: HIGH went 5 -> 0, 10 -> 2 and 2 -> 2, with every known threat
+  still surfacing as HIGH (4/4) and no new false negatives.
+- **WHOIS `updated_date` no longer escalates severity.** The re-registration heuristic
+  treated any recently-updated old domain as a possible drop-catch, but that field also
+  changes on routine annual renewal, so nearly every actively maintained legacy domain
+  matched. It now only prevents automatic clearing to LOW (case stays `needs_review`),
+  and the rationale says explicitly that a renewal is the likelier explanation.
+- **Recent inert look-alikes get an explicit rule** (`recent_registration_inactive`)
+  instead of the generic `no_matching_rule`, stating that the domain was registered in
+  the hostile-registration window and is currently dormant, so it should be monitored for
+  activation rather than archived.
+- `AGE_THIRD_PARTY_DAYS` moved to shared constants; age is now computed once per
+  classification instead of three times. 6 regression tests.
+
 ## [4.20.1] - 2026-07-18
 
 ### Security / Fixed

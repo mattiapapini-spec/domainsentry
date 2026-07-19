@@ -84,6 +84,11 @@ MARKETPLACE_NS = [
     "buydomains.com", "hugedomains.com",
 ]
 
+# Domains registered longer ago than this predate a typical hostile-registration
+# campaign. Weak threat signals on such domains are downgraded rather than alarmed on
+# (see classifier: age modulation), and inert ones are classified as third parties.
+AGE_THIRD_PARTY_DAYS = 540  # ~18 months
+
 PRIVACY_MX_PROVIDERS = [
     "protonmail.ch", "tutanota.de", "pm.me", "tutamail.com",
 ]

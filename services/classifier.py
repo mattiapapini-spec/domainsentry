@@ -12,7 +12,7 @@ from typing import Optional
 
 from shared.security import apply_security, sanitize_error, sanitize_log_input
 from shared.utils import now_iso
-from shared.constants import (SEVERITY_MAP, KNOWN_PARKING_NS, KNOWN_PARKING_IPS,
+from shared.constants import (SEVERITY_MAP, KNOWN_PARKING_NS, KNOWN_PARKING_IPS, AGE_THIRD_PARTY_DAYS,
                                MARKETPLACE_NS, PRIVACY_MX_PROVIDERS, FORWARDING_MX_PROVIDERS,
                                BUSINESS_MX_PROVIDERS, ENTERPRISE_CERT_PROVIDERS, PARKING_MX)
 
@@ -146,6 +146,23 @@ def classify_variant(v: VariantInput):
     ns_str = " ".join(ns_records).lower()
     hidden_summary = []
 
+    # ── Età del dominio: calcolata PRIMA delle regole, perché modula la severità ──
+    # Un segnale debole (tag nascosti, MX senza sito) su un dominio registrato molti anni
+    # prima della campagna ostile non è un allarme: è il profilo normale di una terza parte
+    # legittima. Su un dominio recente lo stesso segnale è invece rilevante.
+    # NB: `recently_reregistered` NON entra qui. Il campo WHOIS updated_date cambia anche
+    # al semplice rinnovo annuale, quindi quasi ogni dominio storico ancora attivo
+    # risulterebbe "ri-registrato": usarlo per alzare la severità produce falsi positivi in
+    # massa. Serve invece più sotto, dove impedisce lo scagionamento automatico a LOW.
+    age = _domain_age(whois_data)
+    is_aged = age["age_days"] is not None and age["age_days"] > AGE_THIRD_PARTY_DAYS
+    age_years = (age["age_days"] // 365) if age["age_days"] else 0
+
+    def _aged_note(signal: str) -> str:
+        return (f"{signal} su dominio registrato il {age['created']} (~{age_years} anni fa), "
+                f"prima della finestra di registrazione ostile: severità ridotta, "
+                f"verifica manuale consigliata")
+
     # ── Regole di classificazione (ordine di priorità) ──
 
     # PARKING
@@ -186,6 +203,12 @@ def classify_variant(v: VariantInput):
                 hidden_risk = hr
                 hidden_summary = he.get("summary", [])
     if hidden_risk >= 30:
+        # Weak signal: tracking pixels, HTML comments and iframes are common on ordinary
+        # marketing sites. On a long-established domain this is not an alarm.
+        if is_aged:
+            return _result(v.domain, "needs_review", "medium",
+                           "hidden_elements_aged_domain",
+                           _aged_note(f"Tag nascosti ({hidden_risk}/100: {'; '.join(hidden_summary[:2])})"))
         return _result(v.domain, "suspicious", "high",
                        "hidden_elements_detected",
                        f"Tag nascosti ad alto rischio ({hidden_risk}/100): {'; '.join(hidden_summary[:3])}")
@@ -199,8 +222,7 @@ def classify_variant(v: VariantInput):
     # Un sito con contenuto sostanziale è di norma legittimo, MA se il dominio è
     # recente E ha MX attivo, il "sito di facciata + email" è un profilo di typosquat,
     # non di terza parte legittima: non declassare, lascialo alla verifica.
-    _age_pre = _domain_age(whois_data)
-    _recent = _age_pre["age_days"] is not None and _age_pre["age_days"] < 540
+    _recent = age["age_days"] is not None and age["age_days"] < AGE_THIRD_PARTY_DAYS
     if any_http_active and max_content_len > 3000 and not (_recent and mx_records):
         return _result(v.domain, "legitimate_probable", "low",
                        "http_active_substantial_content",
@@ -208,16 +230,30 @@ def classify_variant(v: VariantInput):
 
     # SOSPETTO (infrastruttura)
     if mx_records and not a_records:
+        # An email-only domain is the normal profile of a small business that uses the
+        # name just for mail. It is a threat signal only when the domain is recent.
+        if is_aged:
+            return _result(v.domain, "needs_review", "medium",
+                           "mx_only_aged_domain",
+                           _aged_note("Profilo solo-email (MX senza record A)"))
         return _result(v.domain, "suspicious", "high",
                        "mx_only_no_web",
-                       "MX attivo senza record A — profilo solo-email")
+                       "MX attivo senza record A, profilo solo-email")
 
     if any(pp in mx_str for pp in PRIVACY_MX_PROVIDERS):
+        if is_aged:
+            return _result(v.domain, "needs_review", "medium",
+                           "privacy_mx_aged_domain",
+                           _aged_note(f"MX su provider ad alta privacy ({mx_str[:60]})"))
         return _result(v.domain, "suspicious", "high",
                        "privacy_mx_provider",
                        f"MX su provider ad alta privacy: {mx_str}")
 
     if any(fw in mx_str for fw in FORWARDING_MX_PROVIDERS):
+        if is_aged:
+            return _result(v.domain, "needs_review", "medium",
+                           "forwarding_mx_aged_domain",
+                           _aged_note(f"MX su email forwarding ({mx_str[:60]})"))
         return _result(v.domain, "suspicious", "medium",
                        "forwarding_mx",
                        f"MX su email forwarding: {mx_str}")
@@ -228,28 +264,39 @@ def classify_variant(v: VariantInput):
                        "hidden_elements_moderate",
                        f"Tag nascosti rilevati ({hidden_risk}/100): {'; '.join(hidden_summary[:3])}")
 
-    # ── ETÀ DEL DOMINIO (punto 1) ──
+    # ── ETÀ DEL DOMINIO: classificazione terzo-parte per domini inerti ──
     # La data di registrazione è il discriminante più forte: un dominio registrato
     # molto prima di una campagna ostile, e inerte da allora, è quasi sempre una
     # terza parte legittima. Questo toglie dalla coda i molti domini pre-campagna
     # (nomi propri, terzi storici) oggi marcati genericamente "needs_review".
-    age = _domain_age(whois_data)
     if age["age_days"] is not None:
         # Cautela anti-falso-negativo: se il dominio è vecchio MA aggiornato di recente
         # (possibile ri-registrazione dopo scadenza / cambio titolare), NON lo declassiamo.
         if age["recently_reregistered"]:
             return _result(v.domain, "needs_review", "medium",
                            "old_domain_recently_updated",
-                           f"Dominio datato ({age['created']}) ma aggiornato di recente ({age['updated']}), "
-                           f"possibile ri-registrazione, verifica manuale")
+                           f"Dominio datato ({age['created']}) ma con record WHOIS aggiornato di "
+                           f"recente ({age['updated']}): può trattarsi di un semplice rinnovo, "
+                           f"oppure di un cambio di titolare. Non scagionato in automatico, "
+                           f"verifica manuale")
         # Vecchio (>18 mesi) e senza segnali ostili emersi sopra → terza parte probabile
-        if age["age_days"] > 540:
+        if age["age_days"] > AGE_THIRD_PARTY_DAYS:
             yrs = age["age_days"] // 365
             return _result(v.domain, "likely_third_party", "low",
                            "predates_campaign",
                            f"Registrato il {age['created']} (~{yrs} anni fa), prima della finestra "
                            f"tipica di registrazione ostile e senza segnali di minaccia, "
                            f"probabile terza parte preesistente")
+
+    # Dominio recente senza segnali: non è "nessuna regola", è un look-alike registrato
+    # nella finestra di campagna e ancora inerte. Profilo tipico del dominio tenuto in
+    # caldo per un uso successivo: va monitorato per l'attivazione, non archiviato.
+    if age["age_days"] is not None and not is_aged:
+        return _result(v.domain, "needs_review", "medium",
+                       "recent_registration_inactive",
+                       f"Registrato il {age['created']} ({age['age_days']} giorni fa), nella "
+                       f"finestra di registrazione ostile, ma attualmente senza contenuti né "
+                       f"email attiva: possibile dominio dormiente, monitorare l'attivazione")
 
     # DA VERIFICARE
     return _result(v.domain, "needs_review", "low",

@@ -313,3 +313,67 @@ class TestClassifierSecurity:
     def test_batch_size_capped(self):
         big = {"variants": [{"domain": f"d{i}.com"} for i in range(1001)]}
         assert client.post("/classify/batch", json=big).status_code == 422
+
+
+class TestAgeModulatedSeverity:
+    """Weak threat signals (hidden elements, MX-only, forwarding/privacy MX) are normal on
+    long-established third-party domains. They must alarm only on recent registrations,
+    otherwise the HIGH bucket fills with decades-old legitimate businesses."""
+
+    def _classify(self, domain, whois=None, dns=None, http=None, cert=None):
+        from services.classifier import classify_variant, VariantInput
+        import json
+        vi = VariantInput(domain=domain, whois=whois or {}, dns=dns or {},
+                          http=http or {}, cert=cert or {})
+        return json.loads(classify_variant(vi).body)
+
+    def _hidden(self, risk=45):
+        return {"checks": [{"status_code": 200, "content_length": 5000,
+                            "hidden_elements": {"risk_indicators": risk,
+                                                "summary": ["1 iframe invisibili"]}}]}
+
+    def test_hidden_elements_on_old_domain_is_not_high(self):
+        r = self._classify("comad-example.it",
+                           whois={"creation_date": "2000-10-18T00:00:00"},
+                           dns={"records": {"A": ["1.2.3.4"]}}, http=self._hidden())
+        assert r["auto_classification"] == "needs_review"
+        assert r["rule"] == "hidden_elements_aged_domain"
+
+    def test_hidden_elements_on_recent_domain_is_high(self):
+        r = self._classify("newfake.com",
+                           whois={"creation_date": "2026-03-01T00:00:00"},
+                           dns={"records": {"A": ["1.2.3.4"]}}, http=self._hidden())
+        assert r["auto_classification"] == "suspicious"
+        assert r["rule"] == "hidden_elements_detected"
+
+    def test_mx_only_on_old_domain_is_not_high(self):
+        # a decades-old email-only domain is a normal small business
+        r = self._classify("conod-example.it",
+                           whois={"creation_date": "2008-09-19T00:00:00"},
+                           dns={"records": {"MX": ["10 mxb1.fastweb.it"]}})
+        assert r["auto_classification"] == "needs_review"
+        assert r["rule"] == "mx_only_aged_domain"
+
+    def test_mx_only_on_recent_domain_is_high(self):
+        r = self._classify("armed.com",
+                           whois={"creation_date": "2026-01-03T00:00:00"},
+                           dns={"records": {"MX": ["10 armed-com.mail.protection.outlook.com"]}})
+        assert r["auto_classification"] == "suspicious"
+        assert r["rule"] == "mx_only_no_web"
+
+    def test_renewal_does_not_escalate_old_domain(self):
+        # WHOIS updated_date changes on routine renewal: it must not push an old domain
+        # back into HIGH, only prevent auto-clearing to LOW
+        from datetime import datetime, timedelta
+        recent = (datetime.utcnow() - timedelta(days=20)).strftime("%Y-%m-%dT00:00:00")
+        r = self._classify("renewed.it",
+                           whois={"creation_date": "2001-01-01T00:00:00", "updated_date": recent},
+                           dns={"records": {"A": ["1.2.3.4"]}}, http=self._hidden())
+        assert r["auto_classification"] != "suspicious"
+
+    def test_recent_inert_domain_gets_explicit_rule(self):
+        r = self._classify("dormant.com",
+                           whois={"creation_date": "2026-05-13T00:00:00"},
+                           dns={"records": {"A": ["1.2.3.4"]}})
+        assert r["rule"] == "recent_registration_inactive"
+        assert r["auto_classification"] == "needs_review"
