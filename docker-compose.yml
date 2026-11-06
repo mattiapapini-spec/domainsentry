@@ -1,0 +1,65 @@
+# DomainSentry — Quick Start (single container)
+# All services on port 8000. Just: docker compose up -d
+#
+# For production with separate containers:
+#   docker compose -f docker-compose.prod.yml up -d
+
+services:
+  domainsentry:
+    build: .
+    container_name: domainsentry
+    restart: unless-stopped
+    environment:
+      - SERVICE_NAME=unified
+      - SERVICE_PORT=8000
+      - VT_API_KEY=${VT_API_KEY:-}
+      - OTX_API_KEY=${OTX_API_KEY:-}
+      - ST_API_KEY=${ST_API_KEY:-}
+      - FEED_DATA=/data/feed
+      - EVENTS_DIR=/data/events
+      - BASELINE_DIR=/data/baselines
+      # Case manager (opt-in): set ENABLE_CASE_MANAGER=true in .env to activate
+      - ENABLE_CASE_MANAGER=${ENABLE_CASE_MANAGER:-false}
+      - CASES_DB=/data/cases/cases.db
+      - TOKEN_TTL_HOURS=12
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
+      # Feed write auth (opt-in): requires case-manager enabled
+      - FEED_REQUIRE_AUTH=${FEED_REQUIRE_AUTH:-false}
+      - CASE_MANAGER_URL=http://localhost:8000
+      # Auto case ingestion: pipeline events become cases (opt-in)
+      - CASE_INGEST=${CASE_INGEST:-false}
+      - SERVICE_TOKEN=${SERVICE_TOKEN:-}
+      - CASE_INGEST_TOKEN=${SERVICE_TOKEN:-}
+      - INTEL_STORE=${INTEL_STORE:-false}
+      - INTEL_DIR=/data/intel
+      # Orchestrator URLs — all local in unified mode
+      - FEED_URL=http://localhost:8000
+      - DNS_URL=http://localhost:8000
+      - CERT_URL=http://localhost:8000
+      - HTTP_URL=http://localhost:8000
+      - WHOIS_URL=http://localhost:8000
+      - REP_URL=http://localhost:8000
+      - TWIST_URL=http://localhost:8000
+      - CLASSIFY_URL=http://localhost:8000
+      - EVENT_URL=http://localhost:8000
+    # SECURITY (see README.md § Security): unified mode runs the orchestrator
+    # and all intelligence endpoints on this one port with no app-level auth.
+    # Default bind is loopback-only so the port isn't reachable from the
+    # network out of the box. To expose it deliberately (e.g. behind a
+    # reverse proxy that only forwards authenticated paths), set BIND_ADDR
+    # in .env — e.g. BIND_ADDR=0.0.0.0 — after reading that section.
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${PORT:-8000}:8000"
+    volumes:
+      - domainsentry-data:/data
+      - ./config/whitelists:/data/feed/whitelists
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  domainsentry-data:

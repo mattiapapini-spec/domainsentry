@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+.venv/
+venv/
+.eggs/
+
+# Environment (only the template is versioned)
+.env
+.env*
+!.env.example
+*.env.local
+docker-compose.override*
+
+# Client whitelist data written at RUNTIME through the read-write bind mount
+# (docker-compose mounts ./config/whitelists into the container, and
+# feed_manager._save_whitelist writes both .json and .txt there).
+# These files contain per-client analyst notes and named third parties:
+# they must never reach a public repository. No exception, not even for
+# example.txt: `_safe_client_name` accepts the client name "example", so
+# `_save_whitelist` could write real data to that very path. example.txt stays
+# versioned only because it was already tracked (.gitignore does not apply to
+# tracked files).
+config/whitelists/*
+
+# Local working notes (defect register, agent instructions), and any copy or
+# temporary file of them: kept out of the repository by design.
+BUG-REGISTER*
+CLAUDE.md*
+
+# Docker
+data/
+*.tar.gz
+
+# Runtime data (cases database, event streams): never versioned
+*.db
+*.sqlite*
+*.ndjson
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Test
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# OS
+Thumbs.db

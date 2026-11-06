@@ -1,0 +1,61 @@
+name: CI
+
+# Il branch principale di questo repository e' `master`, non `main`: con il
+# trigger su `main` la CI non e' mai stata eseguita su un push reale (BUILD-04).
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+# Il workflow legge solo il codice: il token di GITHUB non riceve altri permessi.
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # ruff pinnato: il set di regole di default cambia fra release, quindi con
+      # una versione non pinnata il gate lint passa o fallisce a seconda del
+      # giorno. Le regole sono in pyproject.toml.
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check .
+
+  test:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # httpx e' richiesto da fastapi.testclient.TestClient: senza, l'intera
+      # suite fallisce in fase di collection.
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      # I test di resa della dashboard (CODE-51) eseguono lo script vero in node
+      # e, se node manca, si saltano restando verdi: un runner senza node
+      # passerebbe senza quella protezione (BUILD-07). Con la variabile a "1"
+      # (solo quel valore la attiva) l'assenza di node fa fallire la suite; la
+      # versione stampata prima serve a capire dal log quale node c'era.
+      - run: node --version
+      - run: PYTHONPATH=. pytest tests/ -v
+        env:
+          DOMAINSENTRY_REQUIRE_NODE: "1"
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose build
+      - run: |
+          docker compose up -d
+          sleep 10
+          curl -sf http://localhost:8000/health
+          curl -sf http://localhost:8000/dns?domain=example.com
+          docker compose down

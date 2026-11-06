@@ -1,0 +1,39 @@
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+exclude = [".git", "__pycache__", ".venv", "venv", "data"]
+
+[tool.ruff.lint]
+# Selezione ESPLICITA delle regole.
+#
+# Il set di default di ruff cambia fra una release e l'altra: con `pip install ruff`
+# non pinnato in CI, il job lint passava o falliva a seconda del giorno. Le regole
+# stanno qui, la versione e' pinnata in requirements-dev.txt.
+#
+# Criterio: segnale, non stile.
+#   E4/E7/E9 — errori di import, di istruzione e di sintassi
+#   F        — pyflakes: nomi non definiti, import e variabili morte (bug reali)
+#   B        — flake8-bugbear: costrutti probabilmente sbagliati.
+#              B005 ha individuato CODE-02 (lstrip("www.") che tronca i domini
+#              che iniziano per 'w') prima di qualunque revisione umana.
+select = ["E4", "E7", "E9", "F", "B"]
+
+ignore = [
+    # L'intera API di FastAPI si basa sulla chiamata nel valore di default:
+    # Query(...), Depends(...), Header(...). Segnalarla significherebbe 44 falsi
+    # positivi su codice idiomatico.
+    "B008",
+    # `import os, json, logging` e `if x: return y` sono usati in modo deliberato e
+    # coerente in tutti i servizi. Imporre la riscrittura ora significherebbe
+    # riformattare file non toccati, rendendo la revisione del diff (Gate 7) piu'
+    # difficile invece che piu' facile.
+    "E401", "E701", "E702",
+    # Import condizionali a meta' modulo: deliberati. unified.py importa il
+    # case-manager solo se abilitato, compat.py sceglie la versione di Pydantic.
+    "E402",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# I test asseriscono su Exception quando verificano che un input malformato venga
+# comunque rifiutato, a prescindere dal tipo di errore che emerge.
+"tests/*" = ["B017"]

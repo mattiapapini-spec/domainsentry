@@ -1,0 +1,13 @@
+# DomainSentry — development dependencies
+#
+# Not needed at runtime. Install on top of requirements.txt:
+#     pip install -r requirements.txt -r requirements-dev.txt
+#
+# Versions are pinned so that the CI lint gate is reproducible: ruff's default
+# rule set changes between releases, so an unpinned `pip install ruff` makes the
+# lint job pass or fail depending on the day. The rules themselves live in
+# pyproject.toml, not in the CI command.
+
+pytest==9.1.1
+httpx==0.28.1      # required by fastapi.testclient.TestClient (starlette)
+ruff==0.16.0

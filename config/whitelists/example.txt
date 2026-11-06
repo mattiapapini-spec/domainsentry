@@ -1,0 +1,5 @@
+# Whitelist verified domains — example_client
+# Format: domain | reason | date
+# Lines starting with # are ignored
+example-legitimate.com | Verified business, unrelated to client brand | 2026-01-15
+example-similar-name.com | Independent software company, confirmed via OSINT | 2026-01-15

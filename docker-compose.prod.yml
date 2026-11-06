@@ -1,0 +1,218 @@
+version: "3.8"
+
+# SECURITY (see README.md § Security): this file implements the two-trust-zone
+# model. The orchestrator and intelligence services (feed-manager, dns-intel,
+# cert-intel, http-fingerprint, whois-intel, reputation, dnstwist-engine,
+# classifier, orchestrator, event-publisher) have no application-level auth by
+# design and MUST stay unreachable from outside the Docker network — hence
+# `expose:` (internal-only), never `ports:` (host-published), on those
+# services. Only `dashboard` and `case-manager` are the authenticated zone and
+# are safe to publish to the host / reverse proxy. Do not "fix" this by adding
+# `ports:` back to the internal services without re-reading that section.
+x-common: &common
+  build: .
+  restart: unless-stopped
+  networks:
+    - domain-intel
+
+services:
+
+  # ═══════════════════════════════════════════
+  # FEED MANAGER — gestione domini e whitelist
+  # ═══════════════════════════════════════════
+  feed-manager:
+    <<: *common
+    container_name: di-feed-manager
+    environment:
+      SERVICE_NAME: feed-manager
+      SERVICE_PORT: "8000"
+      FEED_DATA: /data/feed
+      # Feed write auth (opt-in). Requires case-manager enabled and reachable.
+      FEED_REQUIRE_AUTH: ${FEED_REQUIRE_AUTH:-false}
+      CASE_MANAGER_URL: http://case-manager:8012
+    expose:
+      - "8000"
+    volumes:
+      - feed-data:/data/feed
+      - ./config/whitelists:/data/feed/whitelists
+
+  # ═══════════════════════════════════════════
+  # INTELLIGENCE SERVICES
+  # ═══════════════════════════════════════════
+  dns-intel:
+    <<: *common
+    container_name: di-dns-intel
+    environment:
+      SERVICE_NAME: dns-intel
+      SERVICE_PORT: "8001"
+      DNS_TIMEOUT: "10"
+    expose:
+      - "8001"
+
+  cert-intel:
+    <<: *common
+    container_name: di-cert-intel
+    environment:
+      SERVICE_NAME: cert-intel
+      SERVICE_PORT: "8002"
+      CRTSH_TIMEOUT: "30"
+    expose:
+      - "8002"
+
+  http-fingerprint:
+    <<: *common
+    container_name: di-http-fingerprint
+    environment:
+      SERVICE_NAME: http-fingerprint
+      SERVICE_PORT: "8003"
+      HTTP_TIMEOUT: "15"
+    expose:
+      - "8003"
+
+  whois-intel:
+    <<: *common
+    container_name: di-whois-intel
+    environment:
+      SERVICE_NAME: whois-intel
+      SERVICE_PORT: "8004"
+      WHOIS_TIMEOUT: "10"
+      WHOIS_DELAY: "2"
+      CACHE_TTL: "86400"
+    expose:
+      - "8004"
+
+  reputation:
+    <<: *common
+    container_name: di-reputation
+    environment:
+      SERVICE_NAME: reputation
+      SERVICE_PORT: "8005"
+      VT_API_KEY: ${VT_API_KEY:-}
+      OTX_API_KEY: ${OTX_API_KEY:-}
+      ST_API_KEY: ${ST_API_KEY:-}
+    expose:
+      - "8005"
+
+  dnstwist-engine:
+    <<: *common
+    container_name: di-dnstwist
+    environment:
+      SERVICE_NAME: dnstwist-engine
+      SERVICE_PORT: "8006"
+    expose:
+      - "8006"
+
+  # ═══════════════════════════════════════════
+  # CLASSIFIER — diffing + auto-classificazione
+  # ═══════════════════════════════════════════
+  classifier:
+    <<: *common
+    container_name: di-classifier
+    environment:
+      SERVICE_NAME: classifier
+      SERVICE_PORT: "8007"
+      BASELINE_DIR: /data/baselines
+    expose:
+      - "8007"
+    volumes:
+      - baseline-data:/data/baselines
+
+  # ═══════════════════════════════════════════
+  # ORCHESTRATOR — pipeline coordinator
+  # ═══════════════════════════════════════════
+  orchestrator:
+    <<: *common
+    container_name: di-orchestrator
+    environment:
+      SERVICE_NAME: orchestrator
+      SERVICE_PORT: "8010"
+      FEED_URL: http://feed-manager:8000
+      DNS_URL: http://dns-intel:8001
+      CERT_URL: http://cert-intel:8002
+      HTTP_URL: http://http-fingerprint:8003
+      WHOIS_URL: http://whois-intel:8004
+      REP_URL: http://reputation:8005
+      TWIST_URL: http://dnstwist-engine:8006
+      CLASSIFY_URL: http://classifier:8007
+      EVENT_URL: http://event-publisher:8011
+    expose:
+      - "8010"
+    depends_on:
+      - feed-manager
+      - dns-intel
+      - cert-intel
+      - http-fingerprint
+      - whois-intel
+      - reputation
+      - classifier
+      - event-publisher
+
+  # ═══════════════════════════════════════════
+  # EVENT PUBLISHER — routing eventi
+  # ═══════════════════════════════════════════
+  event-publisher:
+    <<: *common
+    container_name: di-events
+    environment:
+      SERVICE_NAME: event-publisher
+      SERVICE_PORT: "8011"
+      EVENTS_DIR: /data/events
+      TARGET_FILE_ENABLED: "true"
+      TARGET_WEBHOOK_ENABLED: "false"
+      WEBHOOK_URL: ${WEBHOOK_URL:-}
+    expose:
+      - "8011"
+    volumes:
+      - event-data:/data/events
+
+  # ═══════════════════════════════════════════
+  # CASE MANAGER — SOC case management + auth (opt-in)
+  # Stateful: requires persistent volume for SQLite
+  # ═══════════════════════════════════════════
+  case-manager:
+    <<: *common
+    container_name: di-case-manager
+    environment:
+      SERVICE_NAME: case-manager
+      SERVICE_PORT: "8012"
+      CASES_DB: /data/cases/cases.db
+      TOKEN_TTL_HOURS: "12"
+      FEED_URL: http://feed-manager:8000
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+    ports:
+      - "8012:8012"
+    volumes:
+      - case-data:/data/cases
+    depends_on:
+      - feed-manager
+
+  # ═══════════════════════════════════════════
+  # DASHBOARD — SOC triage UI (opt-in)
+  # Serves the static HTML page. Calls the case-manager API.
+  # NOTE: in this multi-container layout the dashboard (:8013) and the
+  # case-manager (:8012) are different origins, so browser calls are
+  # cross-origin. Put both behind one reverse proxy (same origin) in
+  # production, or enable CORS on the case-manager. In unified mode this
+  # is a non-issue (same port).
+  # ═══════════════════════════════════════════
+  dashboard:
+    <<: *common
+    container_name: di-dashboard
+    environment:
+      SERVICE_NAME: dashboard
+      SERVICE_PORT: "8013"
+    ports:
+      - "8013:8013"
+    depends_on:
+      - case-manager
+
+networks:
+  domain-intel:
+    driver: bridge
+
+volumes:
+  feed-data:
+  baseline-data:
+  event-data:
+  case-data:

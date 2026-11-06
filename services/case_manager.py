@@ -1,0 +1,974 @@
+"""
+Case Manager Service (:8012)
+============================
+SOC case management with structured auth.
+
+- User management (admin creates users, assigns roles/permissions)
+- Token-based authentication (opaque tokens, hashed at rest)
+- Case lifecycle: new → in_progress → closed (TP/FP/benign)
+- Assignment, notes, audit history
+- Whitelist action (proxies to feed-manager) closes case as FP
+
+Opt-in service: not required for the intelligence pipeline.
+Enable it when you want case management inside DomainSentry instead
+of an external SOAR.
+"""
+
+from typing import Optional, List
+import os
+import json
+import sqlite3
+import logging
+import secrets
+import hmac
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from contextlib import contextmanager
+
+import requests
+from fastapi import FastAPI, APIRouter, Depends, HTTPException, Header, Request
+from fastapi.responses import JSONResponse
+from shared.compat import BaseModel, field_validator, Field
+
+from shared.security import apply_security, sanitize_error, sanitize_log_input
+from shared.auth import (hash_password, verify_password, generate_token,
+                         hash_token, permissions_for_role, ROLE_PRESETS, PERMISSIONS)
+
+logger = logging.getLogger("case-manager")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [CASE] %(message)s")
+
+app = FastAPI(title="Case Manager", version="4.1.0")
+apply_security(app)
+router = APIRouter()
+
+DB_PATH = os.environ.get("CASES_DB", "/data/cases/cases.db")
+TOKEN_TTL_HOURS = int(os.environ.get("TOKEN_TTL_HOURS", "12"))
+FEED_URL = os.environ.get("FEED_URL", "http://feed-manager:8000")
+
+# Optional service token for service-to-service calls (e.g. orchestrator case
+# ingest). A non-expiring static secret mapped to a limited service identity.
+# Set SERVICE_TOKEN to a long random value; leave empty to disable.
+SERVICE_TOKEN = os.environ.get("SERVICE_TOKEN", "")
+SERVICE_PERMISSIONS = ["manage_cases", "view"]
+
+VALID_STATUSES = ["new", "in_progress", "closed_tp", "closed_fp", "closed_benign"]
+CLOSED_STATUSES = ["closed_tp", "closed_fp", "closed_benign"]
+
+# Ordering used to decide whether a re-scan escalates a closed case back into the queue.
+# INFO (the closure downgrade, see _closes_without_residual_risk) is deliberately absent:
+# it is a system-assigned marker, not an analyst-facing rank, and letting unknown values
+# fall through to the SEVERITY_RANK.get(..., SEVERITY_RANK["MEDIUM"]) default below keeps
+# reopen-threshold math unchanged for cases downgraded to INFO before this field existed.
+SEVERITY_RANK = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+
+# Classification emitted by classifier.py when enrichment could not run (crt.sh
+# unreachable, VT quota exhausted, ...): "I couldn't look", not "I looked and it's
+# worse". It happens to carry severity MEDIUM, which would outrank any case closed
+# at LOW under a pure severity comparison — but a collection failure is not new
+# evidence about the domain, so it must never reopen a case a human closed
+# (BUG-REGISTER CODE-26). The check below is on this value, not on severity, so a
+# real re-classification (e.g. needs_review/MEDIUM) still reopens as before.
+COLLECTION_FAILURE_CLASSIFICATION = "insufficient_data"
+
+
+def _closes_without_residual_risk(old_status: str, new_status: str) -> bool:
+    """True for a transition landing on closed_fp/closed_benign from a status that
+    was not already there: these dispositions carry no residual risk, so `severity`
+    is masked to INFO while the pre-closure value is preserved in
+    severity_at_detection for per-detector precision reporting (PRC-02).
+
+    closed_tp is excluded: a confirmed true positive is a real incident and its
+    severity is not touched, so it already *is* the value observed at detection —
+    a parallel field would be redundant for that disposition."""
+    return new_status in ("closed_fp", "closed_benign") and old_status not in ("closed_fp", "closed_benign")
+
+
+# ═══════════════════════════════════════════════════════════════
+# DATABASE
+# ═══════════════════════════════════════════════════════════════
+
+@contextmanager
+def get_db():
+    """Connection per operation. WAL mode + busy_timeout for concurrency."""
+    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA foreign_keys=ON")
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def init_db():
+    """Create schema and bootstrap admin if no users exist."""
+    with get_db() as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                salt TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'viewer',
+                permissions TEXT NOT NULL DEFAULT '[]',
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                created_by TEXT
+            );
+            CREATE TABLE IF NOT EXISTS sessions (
+                token_hash TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            );
+            CREATE TABLE IF NOT EXISTS cases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                domain TEXT NOT NULL,
+                client TEXT NOT NULL,
+                classification TEXT,
+                confidence TEXT,
+                severity TEXT,
+                status TEXT NOT NULL DEFAULT 'new',
+                assignee_id INTEGER,
+                rationale TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(domain, client),
+                FOREIGN KEY (assignee_id) REFERENCES users(id)
+            );
+            CREATE TABLE IF NOT EXISTS case_notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                case_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                note TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (case_id) REFERENCES cases(id)
+            );
+            CREATE TABLE IF NOT EXISTS case_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                case_id INTEGER NOT NULL,
+                user_id INTEGER,
+                action TEXT NOT NULL,
+                detail TEXT,
+                timestamp TEXT NOT NULL,
+                FOREIGN KEY (case_id) REFERENCES cases(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_cases_status ON cases(status);
+            CREATE INDEX IF NOT EXISTS idx_cases_client ON cases(client);
+            CREATE INDEX IF NOT EXISTS idx_cases_assignee ON cases(assignee_id);
+        """)
+
+        # ── Schema migrations (idempotent; safe on existing production DBs) ──
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(cases)").fetchall()}
+        if "severity_locked" not in cols:
+            # Marks a severity set by an analyst. Locked severities are never overwritten
+            # by automatic re-classification, so manual judgement survives re-scans.
+            conn.execute("ALTER TABLE cases ADD COLUMN severity_locked INTEGER NOT NULL DEFAULT 0")
+            logger.info("Migration: added cases.severity_locked")
+        if "pending_severity" not in cols:
+            # When the classifier disagrees upward with a manually set severity it does
+            # not overwrite it: it files a proposal the analyst can approve or reject.
+            conn.execute("ALTER TABLE cases ADD COLUMN pending_severity TEXT")
+            conn.execute("ALTER TABLE cases ADD COLUMN pending_severity_reason TEXT")
+            conn.execute("ALTER TABLE cases ADD COLUMN pending_severity_at TEXT")
+            logger.info("Migration: added cases.pending_severity fields")
+        if "severity_at_detection" not in cols:
+            # Records the severity observed when the case was first raised, independent
+            # of the INFO downgrade applied to closed_fp/closed_benign cases (PRC-02):
+            # a resolved, no-risk case must stop polluting severity-based backlog
+            # filters, but per-detector precision still needs to know what it looked
+            # like at detection time.
+            conn.execute("ALTER TABLE cases ADD COLUMN severity_at_detection TEXT")
+            # Retrofit: closed_fp/closed_benign rows that predate this migration were
+            # never reconciled, so their current `severity` IS what was observed at
+            # detection — capture it before applying the same downgrade new closures
+            # get, instead of leaving severity_at_detection NULL for all of them.
+            conn.execute(
+                "UPDATE cases SET severity_at_detection = severity, severity = 'INFO' "
+                "WHERE status IN ('closed_fp', 'closed_benign')"
+            )
+            logger.info("Migration: added cases.severity_at_detection, "
+                        "reconciled pre-existing closed_fp/closed_benign cases")
+
+        # Bootstrap admin
+        count = conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
+        if count == 0:
+            admin_user = os.environ.get("ADMIN_USERNAME", "admin")
+            admin_pass = os.environ.get("ADMIN_PASSWORD")
+            generated = False
+            if not admin_pass:
+                admin_pass = secrets.token_urlsafe(16)
+                generated = True
+            ph, salt = hash_password(admin_pass)
+            conn.execute(
+                "INSERT INTO users (username, password_hash, salt, role, permissions, active, created_at, created_by) "
+                "VALUES (?, ?, ?, 'admin', ?, 1, ?, 'bootstrap')",
+                (admin_user, ph, salt, json.dumps(permissions_for_role("admin")), _now())
+            )
+            if generated:
+                logger.warning("=" * 60)
+                logger.warning("BOOTSTRAP ADMIN CREATED")
+                logger.warning(f"  username: {admin_user}")
+                logger.warning(f"  password: {admin_pass}")
+                logger.warning("  CHANGE THIS PASSWORD IMMEDIATELY via /users/{id}/password")
+                logger.warning("=" * 60)
+            else:
+                logger.info(f"Bootstrap admin '{admin_user}' created from ADMIN_PASSWORD env")
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ═══════════════════════════════════════════════════════════════
+# AUTH DEPENDENCIES
+# ═══════════════════════════════════════════════════════════════
+
+def get_current_user(authorization: str = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Missing or invalid Authorization header")
+    token = authorization[7:]
+
+    # Service token (service-to-service). Constant-time compare, non-expiring,
+    # limited permissions. Only active when SERVICE_TOKEN is configured.
+    if SERVICE_TOKEN and hmac.compare_digest(token, SERVICE_TOKEN):
+        return {"id": None, "username": "svc-orchestrator",
+                "role": "service", "permissions": list(SERVICE_PERMISSIONS)}
+
+    token_h = hash_token(token)
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT s.user_id, s.expires_at, u.username, u.role, u.permissions, u.active "
+            "FROM sessions s JOIN users u ON s.user_id = u.id WHERE s.token_hash = ?",
+            (token_h,)
+        ).fetchone()
+    if not row:
+        raise HTTPException(401, "Invalid token")
+    if datetime.fromisoformat(row["expires_at"]) < datetime.now(timezone.utc):
+        raise HTTPException(401, "Token expired")
+    if not row["active"]:
+        raise HTTPException(403, "User account disabled")
+    return {
+        "id": row["user_id"], "username": row["username"],
+        "role": row["role"], "permissions": json.loads(row["permissions"]),
+    }
+
+
+def require(permission: str):
+    """Dependency factory: require a specific permission."""
+    def checker(user=Depends(get_current_user)):
+        if permission not in user["permissions"]:
+            raise HTTPException(403, f"Permission required: {permission}")
+        return user
+    return checker
+
+
+def _audit(conn, case_id: int, user_id, action: str, detail: str = ""):
+    conn.execute(
+        "INSERT INTO case_history (case_id, user_id, action, detail, timestamp) VALUES (?, ?, ?, ?, ?)",
+        (case_id, user_id, action, detail, _now())
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
+# HEALTH
+# ═══════════════════════════════════════════════════════════════
+
+@app.get("/health")
+def health():
+    try:
+        with get_db() as conn:
+            n = conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
+        return {"status": "healthy", "service": "case-manager", "version": "4.1.0", "users": n}
+    except Exception as e:
+        return JSONResponse(status_code=503,
+                            content={"status": "degraded", "error": sanitize_error(e)})
+
+
+# ═══════════════════════════════════════════════════════════════
+# AUTH ENDPOINTS
+# ═══════════════════════════════════════════════════════════════
+
+class LoginRequest(BaseModel):
+    username: str = Field(..., max_length=120)
+    password: str
+
+
+# ── Login rate limiting (brute-force / credential-stuffing mitigation) ──
+import time as _time
+LOGIN_MAX_FAILURES = int(os.environ.get("LOGIN_MAX_FAILURES", "5"))
+LOGIN_WINDOW_SEC = int(os.environ.get("LOGIN_WINDOW_SEC", "300"))  # 5 min
+_login_failures: dict = {}  # ip -> [timestamps of recent failures]
+
+
+def _rl_check(ip: str):
+    now = _time.time()
+    fails = [t for t in _login_failures.get(ip, []) if now - t < LOGIN_WINDOW_SEC]
+    _login_failures[ip] = fails
+    if len(fails) >= LOGIN_MAX_FAILURES:
+        retry = int(LOGIN_WINDOW_SEC - (now - fails[0]))
+        raise HTTPException(429, f"Too many failed login attempts. Try again in {retry}s.")
+
+
+def _rl_record_failure(ip: str):
+    _login_failures.setdefault(ip, []).append(_time.time())
+
+
+def _rl_reset(ip: str):
+    _login_failures.pop(ip, None)
+
+
+@router.post("/auth/login", tags=["Auth"])
+def login(req: LoginRequest, request: Request):
+    # Rate limit failed logins per client IP to blunt brute-force / credential
+    # stuffing. In-memory sliding window; resets on restart (acceptable for a
+    # single-instance deployment — for multi-instance, front with a WAF/proxy).
+    client_ip = request.client.host if request.client else "unknown"
+    _rl_check(client_ip)
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT id, password_hash, salt, active FROM users WHERE username = ?",
+            (req.username,)
+        ).fetchone()
+        # Constant-ish: always verify to reduce username enumeration timing
+        if row:
+            ok = verify_password(req.password, row["password_hash"], row["salt"])
+        else:
+            verify_password(req.password, "0" * 64, "0" * 32)
+            ok = False
+        if not row or not ok:
+            _rl_record_failure(client_ip)
+            raise HTTPException(401, "Invalid credentials")
+        if not row["active"]:
+            raise HTTPException(403, "User account disabled")
+
+        _rl_reset(client_ip)  # successful login clears the counter
+        token = generate_token()
+        expires = (datetime.now(timezone.utc) + timedelta(hours=TOKEN_TTL_HOURS)).isoformat()
+        conn.execute(
+            "INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+            (hash_token(token), row["id"], _now(), expires)
+        )
+    logger.info(f"Login: {sanitize_log_input(req.username)}")
+    return {"token": token, "expires_at": expires, "token_type": "Bearer"}
+
+
+@router.post("/auth/logout", tags=["Auth"])
+def logout(authorization: str = Header(None), user=Depends(get_current_user)):
+    token = authorization[7:]
+    with get_db() as conn:
+        conn.execute("DELETE FROM sessions WHERE token_hash = ?", (hash_token(token),))
+    return {"status": "logged_out"}
+
+
+@router.get("/auth/me", tags=["Auth"])
+def me(user=Depends(get_current_user)):
+    return user
+
+
+# ═══════════════════════════════════════════════════════════════
+# USER MANAGEMENT (admin only)
+# ═══════════════════════════════════════════════════════════════
+
+class UserCreate(BaseModel):
+    username: str = Field(..., max_length=120)
+    password: str
+    role: str = "viewer"
+    permissions: Optional[List[str]] = None  # override; defaults from role
+
+    @field_validator("username")
+    @classmethod
+    def valid_username(cls, v):
+        import re
+        if not re.match(r'^[a-zA-Z0-9_.-]{2,64}$', v):
+            raise ValueError("Username: 2-64 chars, alphanumeric/dot/dash/underscore")
+        return v
+
+    @field_validator("password")
+    @classmethod
+    def valid_password(cls, v):
+        if len(v) < 10:
+            raise ValueError("Password must be at least 10 characters")
+        return v
+
+    @field_validator("role")
+    @classmethod
+    def valid_role(cls, v):
+        if v not in ROLE_PRESETS:
+            raise ValueError(f"Role must be one of: {', '.join(ROLE_PRESETS)}")
+        return v
+
+
+@router.post("/users", tags=["Users"])
+def create_user(req: UserCreate, admin=Depends(require("manage_users"))):
+    perms = req.permissions if req.permissions is not None else permissions_for_role(req.role)
+    invalid = set(perms) - set(PERMISSIONS)
+    if invalid:
+        raise HTTPException(400, f"Invalid permissions: {invalid}")
+    ph, salt = hash_password(req.password)
+    try:
+        with get_db() as conn:
+            cur = conn.execute(
+                "INSERT INTO users (username, password_hash, salt, role, permissions, active, created_at, created_by) "
+                "VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
+                (req.username, ph, salt, req.role, json.dumps(perms), _now(), admin["username"])
+            )
+            uid = cur.lastrowid
+    except sqlite3.IntegrityError as e:
+        raise HTTPException(409, f"Username '{req.username}' already exists") from e
+    logger.info(f"User created: {sanitize_log_input(req.username)} (role={req.role}) by {sanitize_log_input(admin['username'])}")
+    return {"id": uid, "username": req.username, "role": req.role, "permissions": perms}
+
+
+@router.get("/users/assignable", tags=["Users"])
+def assignable_users(user=Depends(require("assign_cases"))):
+    """
+    Minimal list of active users (id + username only) for populating the
+    assignment dropdown. Available to anyone who can assign cases — usernames
+    are not sensitive, and this avoids requiring full manage_users (admin) just
+    to assign a case to a colleague.
+    """
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id, username FROM users WHERE active=1 ORDER BY username"
+        ).fetchall()
+    return {"users": [{"id": r["id"], "username": r["username"]} for r in rows]}
+
+
+@router.get("/users", tags=["Users"])
+def list_users(admin=Depends(require("manage_users"))):
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id, username, role, permissions, active, created_at, created_by FROM users ORDER BY id"
+        ).fetchall()
+    return {"users": [
+        {"id": r["id"], "username": r["username"], "role": r["role"],
+         "permissions": json.loads(r["permissions"]), "active": bool(r["active"]),
+         "created_at": r["created_at"], "created_by": r["created_by"]}
+        for r in rows
+    ]}
+
+
+class UserUpdate(BaseModel):
+    role: Optional[str] = None
+    permissions: Optional[List[str]] = None
+    active: Optional[bool] = None
+
+
+@router.patch("/users/{user_id}", tags=["Users"])
+def update_user(user_id: int, req: UserUpdate, admin=Depends(require("manage_users"))):
+    with get_db() as conn:
+        row = conn.execute("SELECT id, username, role, permissions, active FROM users WHERE id = ?",
+                           (user_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "User not found")
+
+        role = req.role if req.role is not None else row["role"]
+        if req.role is not None and req.role not in ROLE_PRESETS:
+            raise HTTPException(400, f"Invalid role: {req.role}")
+
+        if req.permissions is not None:
+            invalid = set(req.permissions) - set(PERMISSIONS)
+            if invalid:
+                raise HTTPException(400, f"Invalid permissions: {invalid}")
+            perms = req.permissions
+        elif req.role is not None:
+            perms = permissions_for_role(req.role)
+        else:
+            perms = json.loads(row["permissions"])
+
+        active = row["active"] if req.active is None else (1 if req.active else 0)
+
+        # Guard: don't let the last active admin be demoted/disabled
+        if row["role"] == "admin" and (role != "admin" or active == 0):
+            admin_count = conn.execute(
+                "SELECT COUNT(*) AS n FROM users WHERE role='admin' AND active=1 AND id != ?",
+                (user_id,)
+            ).fetchone()["n"]
+            if admin_count == 0:
+                raise HTTPException(400, "Cannot demote/disable the last active admin")
+
+        conn.execute("UPDATE users SET role=?, permissions=?, active=? WHERE id=?",
+                     (role, json.dumps(perms), active, user_id))
+        # If disabled, revoke sessions
+        if active == 0:
+            conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+    return {"id": user_id, "role": role, "permissions": perms, "active": bool(active)}
+
+
+class PasswordReset(BaseModel):
+    password: str
+    current_password: Optional[str] = None  # required for self-change, not for admin reset
+
+    @field_validator("password")
+    @classmethod
+    def valid(cls, v):
+        if len(v) < 10:
+            raise ValueError("Password must be at least 10 characters")
+        return v
+
+
+@router.post("/users/{user_id}/password", tags=["Users"])
+def reset_password(user_id: int, req: PasswordReset, user=Depends(get_current_user)):
+    is_admin = "manage_users" in user["permissions"]
+    is_self = user["id"] == user_id
+    # Admin can reset anyone; a non-admin can only change their own password.
+    if not is_admin and not is_self:
+        raise HTTPException(403, "Can only change your own password")
+    with get_db() as conn:
+        row = conn.execute("SELECT id, password_hash, salt FROM users WHERE id = ?", (user_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "User not found")
+        # When a user changes their OWN password, require the current one (standard
+        # practice: a hijacked session shouldn't be able to silently rotate the
+        # password). An admin resetting someone else's password is an administrative
+        # reset and doesn't need the target's current password.
+        if is_self:
+            if not req.current_password:
+                raise HTTPException(400, "Current password required to change your own password")
+            if not verify_password(req.current_password, row["password_hash"], row["salt"]):
+                raise HTTPException(403, "Current password is incorrect")
+        ph, salt = hash_password(req.password)
+        conn.execute("UPDATE users SET password_hash=?, salt=? WHERE id=?", (ph, salt, user_id))
+        # Revoke existing sessions on password change
+        conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+    return {"status": "password_changed", "id": user_id}
+
+
+# ═══════════════════════════════════════════════════════════════
+# CASES
+# ═══════════════════════════════════════════════════════════════
+
+class CaseIngest(BaseModel):
+    domain: str = Field(..., max_length=253)          # max DNS name length
+    client: str = Field(..., max_length=120)
+    classification: Optional[str] = Field(None, max_length=64)
+    confidence: Optional[str] = None
+    severity: Optional[str] = None
+    rationale: Optional[str] = Field(None, max_length=2000)
+
+
+@router.post("/cases/ingest", tags=["Cases"])
+def ingest_case(req: CaseIngest, user=Depends(require("manage_cases"))):
+    """
+    Ingest an event into a case. Called by orchestrator/event-publisher or manually.
+    - New domain → create case (status=new)
+    - Open case → update classification
+    - Closed case → reopen only if the new severity is HIGHER than the recorded one
+      (a domain closed as benign that later arms itself must come back to the queue)
+    """
+    with get_db() as conn:
+        existing = conn.execute(
+            "SELECT id, status, severity, severity_locked, severity_at_detection "
+            "FROM cases WHERE domain=? AND client=?",
+            (req.domain, req.client)
+        ).fetchone()
+
+        if not existing:
+            cur = conn.execute(
+                "INSERT INTO cases (domain, client, classification, confidence, severity, rationale, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'new', ?, ?)",
+                (req.domain, req.client, req.classification, req.confidence,
+                 req.severity, req.rationale, _now(), _now())
+            )
+            cid = cur.lastrowid
+            _audit(conn, cid, user["id"], "created", f"classification={req.classification}")
+            return {"id": cid, "status": "new", "created": True}
+
+        cid = existing["id"]
+        locked = bool(existing["severity_locked"])
+        if existing["status"] in CLOSED_STATUSES:
+            # `severity` may have been downgraded to INFO at closure (PRC-02); the value
+            # that actually reflects last-known risk for the escalation check below is
+            # severity_at_detection when the closure set one (closed_fp/closed_benign).
+            old_sev = (existing["severity_at_detection"] or existing["severity"] or "").upper()
+            new_sev = (req.severity or "").upper()
+            # Escalation only: re-open when the threat level actually grew. A closed
+            # case that re-classifies at the same or a lower severity stays closed, so
+            # routine re-scans don't undo the analyst's triage.
+            # If the stored severity is unknown, assume MEDIUM (the system-wide default)
+            # rather than 0, otherwise any LOW finding would reopen the case.
+            old_rank = SEVERITY_RANK.get(old_sev, SEVERITY_RANK["MEDIUM"])
+            new_rank = SEVERITY_RANK.get(new_sev, 0)
+            # A collection failure is excluded from the escalation check regardless
+            # of its severity rank: see COLLECTION_FAILURE_CLASSIFICATION above.
+            if new_rank > old_rank and req.classification != COLLECTION_FAILURE_CLASSIFICATION:
+                # A manually set severity is preserved even here: the case comes back
+                # into the queue (that's the point), but the analyst's rating stands and
+                # a proposal is filed for them to approve or reject.
+                if locked:
+                    conn.execute("UPDATE cases SET status='new', classification=?, confidence=?, rationale=?, "
+                                 "severity=COALESCE(severity_at_detection, severity), severity_at_detection=NULL, "
+                                 "pending_severity=?, pending_severity_reason=?, pending_severity_at=?, updated_at=? WHERE id=?",
+                                 (req.classification, req.confidence, req.rationale,
+                                  new_sev, req.rationale, _now(), _now(), cid))
+                    _audit(conn, cid, user["id"], "severity_proposed",
+                           f"il classificatore propone {old_sev} → {new_sev} "
+                           f"(severità manuale mantenuta, in attesa di approvazione)")
+                    return {"id": cid, "status": "new", "reopened": True,
+                            "escalated_from": old_sev, "escalated_to": new_sev,
+                            "severity_locked": True, "severity_proposed": new_sev}
+                conn.execute("UPDATE cases SET status='new', classification=?, confidence=?, severity=?, rationale=?, "
+                             "severity_at_detection=NULL, updated_at=? WHERE id=?",
+                             (req.classification, req.confidence, req.severity, req.rationale, _now(), cid))
+                _audit(conn, cid, user["id"], "reopened",
+                       f"auto-reopened: severity escalated {old_sev or 'n/a'} → {new_sev}")
+                return {"id": cid, "status": "new", "reopened": True,
+                        "escalated_from": old_sev, "escalated_to": new_sev}
+            return {"id": cid, "status": existing["status"], "updated": False}
+
+        if locked:
+            # Manual severity stands; everything else still refreshes. If the classifier
+            # now rates the domain HIGHER than the analyst did, file a proposal instead of
+            # silently discarding it, so the disagreement is visible and actionable.
+            old_rank = SEVERITY_RANK.get((existing["severity"] or "").upper(),
+                                         SEVERITY_RANK["MEDIUM"])
+            new_sev = (req.severity or "").upper()
+            if SEVERITY_RANK.get(new_sev, 0) > old_rank:
+                conn.execute("UPDATE cases SET classification=?, confidence=?, rationale=?, "
+                             "pending_severity=?, pending_severity_reason=?, pending_severity_at=?, updated_at=? WHERE id=?",
+                             (req.classification, req.confidence, req.rationale,
+                              new_sev, req.rationale, _now(), _now(), cid))
+                _audit(conn, cid, user["id"], "severity_proposed",
+                       f"il classificatore propone {existing['severity'] or 'n/a'} → {new_sev} "
+                       f"(in attesa di approvazione)")
+                return {"id": cid, "status": existing["status"], "updated": True,
+                        "severity_locked": True, "severity_proposed": new_sev}
+            conn.execute("UPDATE cases SET classification=?, confidence=?, rationale=?, updated_at=? WHERE id=?",
+                         (req.classification, req.confidence, req.rationale, _now(), cid))
+            return {"id": cid, "status": existing["status"], "updated": True,
+                    "severity_locked": True}
+
+        conn.execute("UPDATE cases SET classification=?, confidence=?, severity=?, rationale=?, updated_at=? WHERE id=?",
+                     (req.classification, req.confidence, req.severity, req.rationale, _now(), cid))
+        return {"id": cid, "status": existing["status"], "updated": True}
+
+
+def _cases_where_clause(status: str, client: str, assignee: int, severity: str):
+    """Shared predicate builder for /cases: used by both the page query and the
+    total count, so the two can never diverge (BUG-REGISTER CODE-05)."""
+    where = "WHERE 1=1"
+    params = []
+    if status:
+        where += " AND c.status = ?"; params.append(status)
+    if client:
+        where += " AND c.client = ?"; params.append(client)
+    if assignee is not None:
+        where += " AND c.assignee_id = ?"; params.append(assignee)
+    if severity:
+        where += " AND c.severity = ?"; params.append(severity)
+    return where, params
+
+
+@router.get("/cases", tags=["Cases"])
+def list_cases(status: str = None, client: str = None, assignee: int = None,
+               severity: str = None, limit: int = 100, offset: int = 0,
+               user=Depends(require("view"))):
+    where, params = _cases_where_clause(status, client, assignee, severity)
+    q = ("SELECT c.*, u.username AS assignee_name FROM cases c LEFT JOIN users u ON c.assignee_id = u.id "
+         + where + " ORDER BY c.updated_at DESC LIMIT ? OFFSET ?")
+    with get_db() as conn:
+        rows = conn.execute(q, params + [min(limit, 500), offset]).fetchall()
+        total = conn.execute("SELECT COUNT(*) AS n FROM cases c " + where, params).fetchone()["n"]
+    return {"cases": [dict(r) for r in rows], "count": len(rows), "total": total}
+
+
+@router.get("/cases/{case_id}", tags=["Cases"])
+def get_case(case_id: int, user=Depends(require("view"))):
+    with get_db() as conn:
+        case = conn.execute(
+            "SELECT c.*, u.username AS assignee_name FROM cases c LEFT JOIN users u ON c.assignee_id=u.id WHERE c.id=?",
+            (case_id,)
+        ).fetchone()
+        if not case:
+            raise HTTPException(404, "Case not found")
+        notes = conn.execute(
+            "SELECT n.note, n.created_at, u.username FROM case_notes n JOIN users u ON n.user_id=u.id "
+            "WHERE n.case_id=? ORDER BY n.created_at", (case_id,)
+        ).fetchall()
+        history = conn.execute(
+            "SELECT h.action, h.detail, h.timestamp, u.username FROM case_history h "
+            "LEFT JOIN users u ON h.user_id=u.id WHERE h.case_id=? ORDER BY h.timestamp", (case_id,)
+        ).fetchall()
+    return {"case": dict(case), "notes": [dict(n) for n in notes], "history": [dict(h) for h in history]}
+
+
+class StatusUpdate(BaseModel):
+    status: str
+
+    @field_validator("status")
+    @classmethod
+    def valid(cls, v):
+        if v not in VALID_STATUSES:
+            raise ValueError(f"Status must be one of: {', '.join(VALID_STATUSES)}")
+        return v
+
+
+@router.patch("/cases/{case_id}/status", tags=["Cases"])
+def update_status(case_id: int, req: StatusUpdate, user=Depends(require("manage_cases"))):
+    with get_db() as conn:
+        row = conn.execute("SELECT status, severity, severity_at_detection FROM cases WHERE id=?",
+                           (case_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Case not found")
+        old_status = row["status"]
+        if _closes_without_residual_risk(old_status, req.status):
+            # Closing as FP/benign leaves no residual risk: downgrade to INFO but keep
+            # the severity observed at detection time (PRC-02).
+            conn.execute(
+                "UPDATE cases SET status=?, severity_at_detection=?, severity='INFO', updated_at=? WHERE id=?",
+                (req.status, row["severity"], _now(), case_id))
+        elif old_status in CLOSED_STATUSES and req.status not in CLOSED_STATUSES and row["severity_at_detection"]:
+            # Reopening a case downgraded at a previous closure: restore the severity
+            # it had before, so it is visible again in severity-based backlog filters.
+            conn.execute(
+                "UPDATE cases SET status=?, severity=?, severity_at_detection=NULL, updated_at=? WHERE id=?",
+                (req.status, row["severity_at_detection"], _now(), case_id))
+        else:
+            conn.execute("UPDATE cases SET status=?, updated_at=? WHERE id=?", (req.status, _now(), case_id))
+        _audit(conn, case_id, user["id"], "status_changed", f"{old_status} → {req.status}")
+    return {"id": case_id, "status": req.status}
+
+
+class SeverityUpdate(BaseModel):
+    # None releases the manual override and lets automatic classification resume.
+    severity: Optional[str] = None
+    reason: Optional[str] = Field(None, max_length=1000)
+
+    @field_validator("severity")
+    @classmethod
+    def valid(cls, v):
+        if v is None:
+            return v
+        v = v.upper()
+        if v not in SEVERITY_RANK:
+            raise ValueError(f"Severity must be one of: {', '.join(SEVERITY_RANK)}")
+        return v
+
+
+@router.patch("/cases/{case_id}/severity", tags=["Cases"])
+def update_severity(case_id: int, req: SeverityUpdate, user=Depends(require("manage_cases"))):
+    """Set the severity by hand, overriding automatic classification.
+
+    A manually set severity is *locked*: later re-scans update the classification and
+    rationale but leave the severity alone, so an analyst's judgement is not silently
+    reverted by the classifier. Send severity=null to release the lock and let automatic
+    classification take over again at the next scan."""
+    with get_db() as conn:
+        row = conn.execute("SELECT severity, severity_locked FROM cases WHERE id=?",
+                           (case_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Case not found")
+
+        if req.severity is None:
+            conn.execute("UPDATE cases SET severity_locked=0, "
+                         "pending_severity=NULL, pending_severity_reason=NULL, pending_severity_at=NULL, "
+                         "updated_at=? WHERE id=?",
+                         (_now(), case_id))
+            _audit(conn, case_id, user["id"], "severity_unlocked",
+                   "override rimosso, torna alla classificazione automatica")
+            return {"id": case_id, "severity": row["severity"], "locked": False}
+
+        detail = f"{row['severity'] or 'n/a'} → {req.severity} (manuale)"
+        if req.reason:
+            detail += f": {sanitize_log_input(req.reason)}"
+        # Setting severity by hand is a fresh analyst decision: it supersedes and clears
+        # any pending classifier proposal, so the case doesn't keep showing a stale one.
+        conn.execute("UPDATE cases SET severity=?, severity_locked=1, "
+                     "pending_severity=NULL, pending_severity_reason=NULL, pending_severity_at=NULL, "
+                     "updated_at=? WHERE id=?",
+                     (req.severity, _now(), case_id))
+        _audit(conn, case_id, user["id"], "severity_changed", detail)
+    return {"id": case_id, "severity": req.severity, "locked": True}
+
+
+class SeverityProposalAction(BaseModel):
+    action: str  # approve | reject
+
+    @field_validator("action")
+    @classmethod
+    def valid(cls, v):
+        if v not in ("approve", "reject"):
+            raise ValueError("Action must be 'approve' or 'reject'")
+        return v
+
+
+@router.post("/cases/{case_id}/severity/proposal", tags=["Cases"])
+def resolve_severity_proposal(case_id: int, req: SeverityProposalAction,
+                              user=Depends(require("manage_cases"))):
+    """Approve or reject the severity the classifier proposed for a case whose severity
+    was set manually. Approving adopts the proposed severity (and keeps it locked, since
+    it is now an analyst decision); rejecting keeps the current severity. Either way the
+    proposal is cleared and the outcome is recorded in the audit trail."""
+    with get_db() as conn:
+        row = conn.execute("SELECT severity, pending_severity FROM cases WHERE id=?",
+                           (case_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Case not found")
+        if not row["pending_severity"]:
+            raise HTTPException(400, "No pending severity proposal for this case")
+
+        proposed = row["pending_severity"]
+        current = row["severity"]
+        if req.action == "approve":
+            conn.execute("UPDATE cases SET severity=?, severity_locked=1, pending_severity=NULL, "
+                         "pending_severity_reason=NULL, pending_severity_at=NULL, updated_at=? WHERE id=?",
+                         (proposed, _now(), case_id))
+            _audit(conn, case_id, user["id"], "severity_proposal_approved",
+                   f"{current or 'n/a'} → {proposed} (proposta del classificatore accettata)")
+            return {"id": case_id, "severity": proposed, "approved": True}
+
+        conn.execute("UPDATE cases SET pending_severity=NULL, pending_severity_reason=NULL, "
+                     "pending_severity_at=NULL, updated_at=? WHERE id=?", (_now(), case_id))
+        _audit(conn, case_id, user["id"], "severity_proposal_rejected",
+               f"proposta {proposed} rifiutata, resta {current or 'n/a'}")
+    return {"id": case_id, "severity": current, "approved": False}
+
+
+class AssignRequest(BaseModel):
+    assignee_id: Optional[int]  # None to unassign
+
+
+@router.post("/cases/{case_id}/assign", tags=["Cases"])
+def assign_case(case_id: int, req: AssignRequest, user=Depends(require("assign_cases"))):
+    with get_db() as conn:
+        row = conn.execute("SELECT id FROM cases WHERE id=?", (case_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Case not found")
+        assignee_name = None
+        if req.assignee_id is not None:
+            a = conn.execute("SELECT username FROM users WHERE id=? AND active=1", (req.assignee_id,)).fetchone()
+            if not a:
+                raise HTTPException(404, "Assignee not found or disabled")
+            assignee_name = a["username"]
+        new_status = "in_progress" if req.assignee_id is not None else "new"
+        conn.execute("UPDATE cases SET assignee_id=?, status=CASE WHEN status='new' THEN ? ELSE status END, updated_at=? WHERE id=?",
+                     (req.assignee_id, new_status, _now(), case_id))
+        _audit(conn, case_id, user["id"], "assigned",
+               f"assigned to {assignee_name}" if assignee_name else "unassigned")
+    return {"id": case_id, "assignee_id": req.assignee_id, "assignee_name": assignee_name}
+
+
+class NoteRequest(BaseModel):
+    note: str = Field(..., max_length=5000)
+
+    @field_validator("note")
+    @classmethod
+    def valid(cls, v):
+        v = v.strip()
+        if not v:
+            raise ValueError("Note cannot be empty")
+        if len(v) > 5000:
+            raise ValueError("Note too long (max 5000 chars)")
+        return v
+
+
+@router.post("/cases/{case_id}/notes", tags=["Cases"])
+def add_note(case_id: int, req: NoteRequest, user=Depends(require("add_notes"))):
+    with get_db() as conn:
+        row = conn.execute("SELECT id FROM cases WHERE id=?", (case_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Case not found")
+        conn.execute("INSERT INTO case_notes (case_id, user_id, note, created_at) VALUES (?, ?, ?, ?)",
+                     (case_id, user["id"], req.note, _now()))
+        conn.execute("UPDATE cases SET updated_at=? WHERE id=?", (_now(), case_id))
+    return {"status": "note_added", "case_id": case_id}
+
+
+class WhitelistRequest(BaseModel):
+    reason: str = Field(..., max_length=1000)
+
+    @field_validator("reason")
+    @classmethod
+    def valid(cls, v):
+        v = v.strip()
+        if not v:
+            raise ValueError("Reason cannot be empty")
+        return v
+
+
+@router.post("/cases/{case_id}/whitelist", tags=["Cases"])
+def whitelist_case(case_id: int, req: WhitelistRequest,
+                   authorization: str = Header(None),
+                   user=Depends(require("whitelist"))):
+    """
+    Whitelist the case's domain (proxies to feed-manager) and close as FP.
+    Resolves the false-positive problem: verify once, never re-triage.
+    """
+    with get_db() as conn:
+        case = conn.execute("SELECT domain, client, status, severity FROM cases WHERE id=?",
+                            (case_id,)).fetchone()
+        if not case:
+            raise HTTPException(404, "Case not found")
+
+    # Proxy to feed-manager. Forward the caller's token so the call passes
+    # feed-manager auth when FEED_REQUIRE_AUTH is enabled (same user holds the
+    # 'whitelist' permission that the feed-manager will also check).
+    headers = {"Authorization": authorization} if authorization else {}
+    try:
+        resp = requests.post(
+            f"{FEED_URL}/feed/whitelist?client={case['client']}",
+            json={"domain": case["domain"], "reason": req.reason, "added_by": user["username"]},
+            headers=headers,
+            timeout=10
+        )
+        if not resp.ok:
+            raise HTTPException(502, f"feed-manager rejected whitelist: HTTP {resp.status_code}")
+    except requests.RequestException as e:
+        raise HTTPException(502, f"feed-manager unreachable: {sanitize_error(e)}") from e
+
+    with get_db() as conn:
+        if _closes_without_residual_risk(case["status"], "closed_fp"):
+            # Same reconciliation as update_status() for the same disposition (PRC-02):
+            # kept in one predicate (_closes_without_residual_risk) so the two closure
+            # paths cannot drift apart, echoing the CODE-05 lesson on duplicated WHEREs.
+            conn.execute(
+                "UPDATE cases SET status='closed_fp', severity_at_detection=?, severity='INFO', "
+                "updated_at=? WHERE id=?",
+                (case["severity"], _now(), case_id))
+        else:
+            conn.execute("UPDATE cases SET status='closed_fp', updated_at=? WHERE id=?", (_now(), case_id))
+        _audit(conn, case_id, user["id"], "whitelisted", f"{case['domain']}: {req.reason}")
+        conn.execute("INSERT INTO case_notes (case_id, user_id, note, created_at) VALUES (?, ?, ?, ?)",
+                     (case_id, user["id"], f"Whitelisted and closed as FP: {req.reason}", _now()))
+    logger.info(f"Whitelisted {sanitize_log_input(case['domain'])} by {sanitize_log_input(user['username'])}")
+    return {"id": case_id, "domain": case["domain"], "status": "closed_fp", "whitelisted": True}
+
+
+# ═══════════════════════════════════════════════════════════════
+# DASHBOARD SUMMARY (for triage view)
+# ═══════════════════════════════════════════════════════════════
+
+@router.get("/summary", tags=["Cases"])
+def summary(user=Depends(require("view"))):
+    """Triage summary: counts by status, severity, recent activity."""
+    with get_db() as conn:
+        by_status = {r["status"]: r["n"] for r in conn.execute(
+            "SELECT status, COUNT(*) AS n FROM cases GROUP BY status").fetchall()}
+        by_severity = {r["severity"] or "unknown": r["n"] for r in conn.execute(
+            "SELECT severity, COUNT(*) AS n FROM cases WHERE status NOT IN ('closed_tp','closed_fp','closed_benign') GROUP BY severity").fetchall()}
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        recent = conn.execute(
+            "SELECT COUNT(*) AS n FROM cases WHERE updated_at > ?", (cutoff,)).fetchone()["n"]
+        open_unassigned = conn.execute(
+            "SELECT COUNT(*) AS n FROM cases WHERE status='new' AND assignee_id IS NULL").fetchone()["n"]
+        # Open cases per client (for the Clients view)
+        by_client = {r["client"]: r["n"] for r in conn.execute(
+            "SELECT client, COUNT(*) AS n FROM cases WHERE status NOT IN ('closed_tp','closed_fp','closed_benign') GROUP BY client").fetchall()}
+    return {
+        "by_status": by_status,
+        "open_by_severity": by_severity,
+        "by_client": by_client,
+        "updated_last_24h": recent,
+        "new_unassigned": open_unassigned,
+    }
+
+
+# Initialize DB on import
+init_db()
+
+app.include_router(router)
