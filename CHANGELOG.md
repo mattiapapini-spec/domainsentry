@@ -38,6 +38,12 @@ All notable changes to this project will be documented in this file.
   Python Software Foundation License.
 
 ### Fixed
+- **An error answer from an intelligence service became "no data" without a line in the log
+  (`CODE-71`).** `_fetch_service` returned `None` for any answer that was not ok, and only exceptions
+  were logged: a 500 from `/http` could not be told from a service with nothing to say. **What
+  changes.** An error answer is still no data for that module, and now logs a warning with the
+  service, the HTTP status and the URL. 6 regression tests in
+  `tests/test_service_error_logged_code71.py`.
 - **A body analysis that failed lowered the risk of the domain instead of being a signal
   (`CODE-68`).** An exception while downloading or analysing one page left `/http` with an error:
   the four checks were lost, the `http` section reached the classifier empty, and neither the active
