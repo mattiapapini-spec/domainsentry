@@ -182,7 +182,14 @@ def http_check(
     request_key = object()
 
     def _fetch_and_analyze(url):
-        resp = http_get_with_retry(url, timeout=HTTP_TIMEOUT)
+        # CODE-68: anche lo scaricamento resta su questo URL: un'eccezione qui è un URL non raggiunto, non un errore
+        # di tutto /http. Testo fisso, come gli errori di `http_get_with_retry`.
+        try:
+            resp = http_get_with_retry(url, timeout=HTTP_TIMEOUT)
+        except Exception as exc:
+            logger.warning(f"Fetch failed: {sanitize_log_input(url)} ({type(exc).__name__})")
+            resp = {"status_code": None, "content": None, "headers": {}, "final_url": None,
+                    "error": "fetch failed"}
         check = {
             "url": url,
             "status_code": resp["status_code"],
@@ -202,21 +209,31 @@ def http_check(
 
         if resp["status_code"] and resp["status_code"] < 400 and resp["content"]:
             is_active = True
-            html = resp["content"].decode("utf-8", errors="replace") if isinstance(resp["content"], bytes) else resp["content"]
-            check["content_hash"] = content_hash(html)
-            with _ANALYSIS_TURN.take(len(html), request_key):
-                check["content_hash_canonical"] = content_hash(normalize_html_for_fingerprint(html))
-                check["visible_text_hash"] = content_hash(extract_visible_text(html))
+            # CODE-68: un'analisi che fallisce resta su questo URL e diventa un segnale (`analysis_failed`, letto dal
+            # classificatore nella cascata e nel diff): prima l'eccezione usciva da /http e si perdevano tutti e
+            # quattro i controlli. Chi serve la pagina ne sceglie il markup, quindi nel log solo URL e classe, non il
+            # messaggio. `MemoryError` dice dello stato del processo, non della pagina: esce come prima.
+            try:
+                html = resp["content"].decode("utf-8", errors="replace") if isinstance(resp["content"], bytes) else resp["content"]
+                check["content_hash"] = content_hash(html)
+                with _ANALYSIS_TURN.take(len(html), request_key):
+                    check["content_hash_canonical"] = content_hash(normalize_html_for_fingerprint(html))
+                    check["visible_text_hash"] = content_hash(extract_visible_text(html))
 
-                title = extract_title(html)
-                check["title"] = title.strip()[:200] if title is not None else None
+                    title = extract_title(html)
+                    check["title"] = title.strip()[:200] if title is not None else None
 
-                check["suspicious_patterns"] = detect_suspicious_patterns(html, patterns)
+                    check["suspicious_patterns"] = detect_suspicious_patterns(html, patterns)
 
-                if detect_hidden:
-                    hidden = detect_hidden_elements(html, self_domain=domain)
-                    check["hidden_elements"] = hidden
-                    risk = hidden.get("risk_indicators", 0)
+                    if detect_hidden:
+                        hidden = detect_hidden_elements(html, self_domain=domain)
+                        check["hidden_elements"] = hidden
+                        risk = hidden.get("risk_indicators", 0)
+            except MemoryError:
+                raise
+            except Exception as exc:
+                check["analysis_failed"] = True
+                logger.warning(f"Body analysis failed: {sanitize_log_input(url)} ({type(exc).__name__})")
 
         return check, is_active, risk
 

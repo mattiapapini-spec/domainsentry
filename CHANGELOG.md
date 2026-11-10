@@ -38,6 +38,23 @@ All notable changes to this project will be documented in this file.
   Python Software Foundation License.
 
 ### Fixed
+- **A body analysis that failed lowered the risk of the domain instead of being a signal
+  (`CODE-68`).** An exception while downloading or analysing one page left `/http` with an error:
+  the four checks were lost, the `http` section reached the classifier empty, and neither the active
+  site nor its hidden elements counted any more (a young domain went from HIGH to MEDIUM). Whoever
+  serves the page chooses its markup, so the failure is theirs to cause. **What changes.** A failure
+  stays on its URL: a download that raises is an unreached URL (`error: "fetch failed"`), an analysis
+  that raises gives `analysis_failed: true` and no `hidden_elements`; the other URLs keep their
+  analysis, and the log names the URL and the exception class, not its message. `MemoryError` speaks
+  of the process, not of the page, and still fails the request. The classifier reads the flag, only
+  when it is `true`, at the top of its rules: `suspicious`/high (`body_analysis_failed`), or
+  `needs_review` on a domain that predates the campaign, as for hidden elements; it comes before the
+  parking and the substantial-content rules, because a failed check is still an active site and would
+  otherwise count as parking or as legitimate. The diff raises `legit_body_analysis_failed` on the
+  client's legitimate domain at every cycle the page keeps failing, since no other signal is left on
+  that URL, and `body_analysis_failed` elsewhere the first cycle a URL fails; both HIGH (a page that
+  could not be checked, not an observed injection). 20 regression tests in
+  `tests/test_body_analysis_failure_code68.py`.
 - **The parse of a page depended on the patch level of Python: on older versions a few bytes of markup
   made the body analysis of `/http` fail, on newer ones a `<![CDATA[` hid the markup after it
   (`SEC-51`).** Up to CPython 3.12.11 `HTMLParser` hands every `<![` to
