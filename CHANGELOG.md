@@ -38,6 +38,16 @@ All notable changes to this project will be documented in this file.
   Python Software Foundation License.
 
 ### Fixed
+- **A form or an iframe hidden with the HTML5 `hidden` attribute was not detected (`CLS-01p`).**
+  `hidden_forms` looked only at `style` and at `class`, `invisible_iframes` only at the size and at
+  `style`: `<form hidden action=…>` raised nothing, while the browser does not show the element.
+  **What changes.** A form with the attribute, whatever its value, is hidden, with `technique`
+  `hidden_attribute` (`css_hidden` stays when the style or the class already hide it, so the output of
+  those forms does not change); an iframe with the attribute is invisible and `hidden_attribute` joins
+  its other techniques. Forms and iframes in the fallback content of a closed `<iframe>` stay out, as
+  before. On the first cycle after the update, a monitored legitimate domain that already hides a form
+  or an iframe this way raises the matching alert once. 22 regression tests in
+  `tests/test_hidden_attribute_cls01p.py`.
 - **Hidden inputs were still read with a text scan after forms, iframes and pixels had moved to the
   tokenizer, so a page could hide them or report them wrong (`CLS-01u`).** Valid markup could keep a
   hidden input out of the scan, names and values were cut short, and inputs that the browser does not

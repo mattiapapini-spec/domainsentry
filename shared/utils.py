@@ -1744,11 +1744,15 @@ def detect_hidden_elements(html: str, self_domain: str = None) -> dict:
         # non va corretto qui di soppiatto.
         if not is_hidden:
             is_hidden = "hidden" in (attrs.get("class") or "").lower()
+        technique = "css_hidden"
+        # CLS-01p: l'attributo booleano `hidden` nasconde il form con qualunque valore, anche vuoto.
+        if not is_hidden and "hidden" in attrs:
+            is_hidden, technique = True, "hidden_attribute"
         if is_hidden:
             findings["hidden_forms"].append({
                 "snippet": form["text"][:300],
                 "action": _cap_ioc(attrs.get("action")),
-                "technique": "css_hidden"
+                "technique": technique
             })
 
     # ── 3. Invisible iframes ──
@@ -1791,6 +1795,10 @@ def detect_hidden_elements(html: str, self_domain: str = None) -> dict:
         if re.search(r'(left|top)\s*:\s*-\d{3,}', style, re.IGNORECASE):
             is_hidden = True
             technique.append("offscreen")
+        # CLS-01p: attributo booleano `hidden`, come per i form.
+        if "hidden" in attrs:
+            is_hidden = True
+            technique.append("hidden_attribute")
 
         if is_hidden:
             findings["invisible_iframes"].append({
