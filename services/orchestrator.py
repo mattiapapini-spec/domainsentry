@@ -9,6 +9,7 @@ from fastapi import FastAPI, APIRouter, BackgroundTasks
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional
+from urllib.parse import quote
 import requests
 
 from shared.security import apply_security, sanitize_log_input
@@ -981,7 +982,7 @@ def _run_pipeline(req: TriggerRequest):
                 for legit in legits:
                     _plog(f"  [TWIST] {legit}")
                     try:
-                        tr = _session.get(f"{TWIST_URL}/twist?domain={legit}", timeout=300)
+                        tr = _session.get(f"{TWIST_URL}/twist?domain={quote(legit, safe='')}", timeout=300)
                         if tr.ok:
                             twist_data = tr.json()
                             variant_count = twist_data.get('registered_variants', 0)
@@ -1090,7 +1091,7 @@ def _run_pipeline(req: TriggerRequest):
                                             and vdomain.lower() in WHOIS_ONLY_DOMAINS):
                                         logger.info(f"    [TWIST-WHOIS-ONLY] {sanitize_log_input(vdomain)}")
                                         _, whois_data = _fetch_service(
-                                            "whois", f"{WHOIS_URL}/whois?domain={vdomain}")
+                                            "whois", f"{WHOIS_URL}/whois?domain={quote(vdomain, safe='')}")
                                         collection_status = {"whois": _module_failed(whois_data)}
                                         if not collection_status["whois"]:
                                             _remember_homoglyph_whois(client, vdomain, whois_data)
@@ -1195,16 +1196,18 @@ def _gather_intelligence(domain: str, req: TriggerRequest) -> dict:
 
     intel = {"dns": None, "cert": None, "http": None, "whois": None, "reputation": None}
 
-    # Costruisci la lista dei task da eseguire
+    # Costruisci la lista dei task da eseguire.
+    # SEC-14: il dominio entra codificato, così un `&`, `#` o `?` nel nome non cambia i parametri della chiamata.
+    q = quote(domain, safe="")
     tasks = [
-        ("dns", f"{DNS_URL}/dns?domain={domain}&full=true&subdomains=true"),
-        ("cert", f"{CERT_URL}/cert?domain={domain}"),
-        ("http", f"{HTTP_URL}/http?domain={domain}"),
+        ("dns", f"{DNS_URL}/dns?domain={q}&full=true&subdomains=true"),
+        ("cert", f"{CERT_URL}/cert?domain={q}"),
+        ("http", f"{HTTP_URL}/http?domain={q}"),
     ]
     if req.include_whois:
-        tasks.append(("whois", f"{WHOIS_URL}/whois?domain={domain}"))
+        tasks.append(("whois", f"{WHOIS_URL}/whois?domain={q}"))
     if req.include_reputation:
-        tasks.append(("reputation", f"{REP_URL}/reputation?domain={domain}"))
+        tasks.append(("reputation", f"{REP_URL}/reputation?domain={q}"))
 
     # Esegui in parallelo (guard contro tasks vuoto)
     with ThreadPoolExecutor(max_workers=max(len(tasks), 1)) as executor:

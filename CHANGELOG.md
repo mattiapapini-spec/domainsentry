@@ -38,6 +38,14 @@ All notable changes to this project will be documented in this file.
   Python Software Foundation License.
 
 ### Fixed
+- **The orchestrator put the domain into the URLs of the internal services without encoding it
+  (`SEC-14`).** `/dns`, `/cert`, `/http`, `/whois`, `/reputation`, the dnstwist call and the WHOIS-only
+  lookup of a dormant homoglyph were built as `?domain={domain}&…`: a `&`, `#` or `?` in the name
+  could change the other parameters of the internal call, and only the domain pattern of each service
+  stood in the way. **What changes.** The domain is percent-encoded in all seven URLs, so the service
+  receives exactly the name and the orchestrator's own parameters stay as they are; a malformed name
+  is now rejected by the service as a whole. For an ordinary domain the URLs are identical to before.
+  4 regression tests in `tests/test_internal_urls_encoded_sec14.py`.
 - **A `/diff` that answered with an HTTP error left no line in the log (`CODE-43`).** `_persist_intel`
   logged only the exceptions of the call: with a 500 the comparison with the previous cycle was lost
   without a trace. **What changes.** An error answer (4xx or 5xx) logs a warning with the domain and the status.
