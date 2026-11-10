@@ -1134,10 +1134,29 @@ class _TagCollector(HTMLParser):
     # altrimenti interpretato come markup.
     _SUPPRESS_RAWTEXT = frozenset({"iframe"})
 
-    def set_cdata_mode(self, elem, *, escapable=False):
+    def set_cdata_mode(self, elem, **kwargs):
+        # SEC-51: fino a CPython 3.12.11 la libreria chiama `set_cdata_mode(elem)` e il metodo base non accetta
+        # `escapable`: passarlo sempre faceva fallire ogni pagina con `<script>` o `<style>`. Si inoltra solo ciò che
+        # la libreria passa.
         if elem.lower() in self._SUPPRESS_RAWTEXT:
             return
-        super().set_cdata_mode(elem, escapable=escapable)
+        super().set_cdata_mode(elem, **kwargs)
+
+    def reset(self):
+        super().reset()
+        # SEC-51: le versioni che hanno `_support_cdata` lo accendono a ogni `reset`, e allora `<![CDATA[` apre una
+        # sezione fino a `]]>` che nasconde i tag al suo interno. Nel contenuto HTML il browser la legge come commento
+        # fino al primo `>`: spenta, la libreria fa lo stesso.
+        if hasattr(self, "_set_support_cdata"):
+            self._set_support_cdata(False)
+
+    def parse_marked_section(self, i, report=1):
+        # SEC-51: fino a CPython 3.12.11 ogni `<![` arriva qui, e `_markupbase` solleva `AssertionError` su una parola
+        # chiave sconosciuta (`<![foo[x]]>`): l'analisi della pagina falliva. Le versioni successive, con
+        # `_support_cdata` spento (sopra), lo leggono come commento fino al primo `>`, come il browser nel contenuto
+        # HTML: qui la stessa grammatica.
+        end = self.rawdata.find(">", i + 3)
+        return -1 if end < 0 else end + 1
 
 
 # SEC-48: tre regex della libreria standard (`locatetagend`, `tagfind_tolerant`, `attrfind_tolerant`) ripetono un

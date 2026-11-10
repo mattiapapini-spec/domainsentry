@@ -38,6 +38,24 @@ All notable changes to this project will be documented in this file.
   Python Software Foundation License.
 
 ### Fixed
+- **The parse of a page depended on the patch level of Python: on older versions a few bytes of markup
+  made the body analysis of `/http` fail, on newer ones a `<![CDATA[` hid the markup after it
+  (`SEC-51`).** Up to CPython 3.12.11 `HTMLParser` hands every `<![` to
+  `_markupbase.ParserBase.parse_marked_section`, which raises `AssertionError` on an unknown keyword,
+  and calls `set_cdata_mode` without the `escapable` argument that `_TagCollector` passed on, so every
+  page with `<script>` or `<style>` failed as well. From 3.12.12 (and in 3.13) the library opens a real
+  CDATA section on `<![CDATA[` up to `]]>`, while the browser, in HTML content, ends it at the first
+  `>`: the tags in between were invisible to the analysis and live in the page. Measured with
+  standalone CPython builds: 3.12.3, 3.12.8, 3.12.10 and 3.12.11 raise, 3.12.12 and 3.13 hide.
+  **What changes.** `_TagCollector` reads every `<![` up to the first `>` on every version (CDATA
+  support switched off where the library has it, the marked-section grammar replaced where it does
+  not), and passes on to `set_cdata_mode` only what the library gives it. On CPython 3.12.3 the whole
+  detector suite now passes, where ten tests failed before. Inside `<svg>` or `<math>` the browser
+  keeps CDATA, so markup there can now be counted when it is only text: over-counting, never hiding.
+  The oracle of the `SEC-48` and `SEC-50` equivalence tests now keeps `reset` and
+  `parse_marked_section` of the collector, as it already kept `set_cdata_mode`: they are its grammar,
+  not library parsing. 11 regression tests in `tests/test_marked_section_sec51.py`; the end-to-end
+  ones are red only on the versions they describe.
 - **The version constraint on urllib3 allowed versions on which the decompression-bomb cap of
   `SEC-16` does not hold (`SEC-22`).** `requirements.txt` asked for `urllib3>=2,<3`, and the image
   installs from it at build time. Measured with `TestFetchDecompressionBombGuardrail` (requests
