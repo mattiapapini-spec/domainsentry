@@ -38,6 +38,17 @@ All notable changes to this project will be documented in this file.
   Python Software Foundation License.
 
 ### Fixed
+- **The version constraint on urllib3 allowed versions on which the decompression-bomb cap of
+  `SEC-16` does not hold (`SEC-22`).** `requirements.txt` asked for `urllib3>=2,<3`, and the image
+  installs from it at build time. Measured with `TestFetchDecompressionBombGuardrail` (requests
+  2.32.3, Python 3.12): from 2.0.0 to 2.6.1 the chunked + gzip case decompressed a single chunk of
+  about 20 MB against a threshold of 32 KB; from 2.6.2 (2.6.2, 2.6.3, 2.7.0, 2.8.0) both cases pass.
+  **What changes.** The constraint is `urllib3>=2.6.2,<3`; the requirements still resolve to the same
+  versions today (urllib3 2.8.0). A new test checks the constraint against the measured versions and
+  the installed urllib3 against the constraint, using `packaging`, already installed with pytest. An
+  image built before this change may carry an older urllib3: check it with
+  `python3 -c "import urllib3; print(urllib3.__version__)"` in the container. 11 regression tests in
+  `tests/test_urllib3_constraint_sec22.py`.
 - **`collection_status` of `/classify/variant`, in the unauthenticated zone, was a free dictionary
   (`CODE-31`).** Any key of any length was accepted and ended in the rationale of the collection
   guard (`CODE-30` capped it downstream), and any truthy value, the string `"false"` included,
