@@ -1012,7 +1012,9 @@ def _run_pipeline(req: TriggerRequest):
                                     logger.info(f"    [TWIST-INTEL] {sanitize_log_input(vdomain)}")
                                     try:
                                         vintel = _gather_intelligence(vdomain, req)
-                                        _persist_intel(client, vdomain, legit, vintel)
+                                        # OPS-06: lo stesso flag del ciclo dei domini del feed.
+                                        if INTEL_STORE:
+                                            _persist_intel(client, vdomain, legit, vintel)
                                         # SCO-05: ricorda l'ultimo WHOIS valido di un omografo
                                         # risolvente, per riusarlo (costo zero) se lo stesso
                                         # dominio torna dormiente in un ciclo successivo — v.

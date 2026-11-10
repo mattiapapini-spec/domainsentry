@@ -38,6 +38,14 @@ All notable changes to this project will be documented in this file.
   Python Software Foundation License.
 
 ### Fixed
+- **With `INTEL_STORE=false` the pipeline still wrote snapshots and history for dnstwist variants
+  (`OPS-06`).** The loop over the feed domains checked the flag; the `variant_intel` branch called
+  `_persist_intel` for every resolving variant anyway, which saved the snapshot under `INTEL_DIR` and,
+  with an earlier snapshot, called `/diff` and appended the history. **What changes.** The variant
+  branch checks the same flag: with the store off nothing is written and no `/diff` is called, while
+  the variant is still collected and classified with its intel. With the store off, the homoglyph
+  WHOIS reused by `SCO-05` after a restart can only come from the in-process cache, as the flag
+  implies. 4 regression tests in `tests/test_variant_intel_store_flag_ops06.py`.
 - **A variant found by dnstwist kept the fixed `needs_review` label whenever its intel was not
   collected, and the classifier was never asked (`CODE-17`).** Without `variant_intel`, and with it
   for a variant that does not resolve and is not a homoglyph, the event carried the discovery
