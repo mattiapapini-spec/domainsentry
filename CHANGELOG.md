@@ -38,6 +38,16 @@ All notable changes to this project will be documented in this file.
   Python Software Foundation License.
 
 ### Fixed
+- **A certificate name that was not a string made `/classify/variant` fail with a 500, and the domain
+  stayed without a classification for that cycle (`CODE-18`).** crt.sh can return
+  `"common_name": null`: when that is the only certificate name of a domain, `cert_intel` passes
+  `[None]` in `unique_cn`, and `/classify/variant`, in the unauthenticated zone, takes the payload as
+  it comes. The classifier compared every element with the enterprise certificate providers, and a
+  `None` (or a number) raised `TypeError`.
+  **What changes.** The classifier reads only the elements of `unique_cn` that are strings, and a
+  `unique_cn` that is not a list counts as empty: a null next to an enterprise provider still finds
+  it, and a list of nulls classifies like an empty list. 11 regression tests in
+  `tests/test_classifier_cert_names_code18.py`.
 - **A form or an iframe hidden with the HTML5 `hidden` attribute was not detected (`CLS-01p`).**
   `hidden_forms` looked only at `style` and at `class`, `invisible_iframes` only at the size and at
   `style`: `<form hidden action=…>` raised nothing, while the browser does not show the element.

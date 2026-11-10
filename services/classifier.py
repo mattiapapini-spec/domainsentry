@@ -326,7 +326,10 @@ def _classify_by_rules(v: VariantInput):
 
     # Estrai info cert
     _ct = cert.get("ct_certificates") or {}
-    cert_cns = _ct.get("unique_cn") or []
+    # CODE-18: crt.sh può dare `"common_name": null` e il payload arriva così com'è: un elemento che non è una
+    # stringa faceva fallire con 500 il confronto coi provider enterprise. Solo i nomi contano.
+    _raw_cns = _ct.get("unique_cn")
+    cert_cns = [cn for cn in _raw_cns if isinstance(cn, str)] if isinstance(_raw_cns, list) else []
 
     mx_str = " ".join(mx_records).lower()
     ns_str = " ".join(ns_records).lower()
