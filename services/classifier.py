@@ -10,6 +10,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import Optional
 
+from shared.compat import field_validator
+
 from shared.security import apply_security, sanitize_log_input
 from shared.utils import now_iso, _CONTROL_CHARS, collection_failed, dns_unknown_rtypes, reputation_source_unobserved
 from shared.constants import (SEVERITY_MAP, severity_rank, KNOWN_PARKING_NS, KNOWN_PARKING_IPS, AGE_THIRD_PARTY_DAYS,
@@ -34,6 +36,9 @@ def health():
 # AUTO-CLASSIFICAZIONE VARIANTI
 # ═══════════════════════════════════════════════════════════════
 
+_COLLECTION_SECTIONS = frozenset({"dns", "cert", "http", "whois", "reputation"})
+
+
 class VariantInput(BaseModel):
     # SCO-05 caso #9 (security-reviewer): senza un tetto, un dominio
     # anomalmente lungo è un amplificatore di DoS non autenticato su questo
@@ -53,6 +58,17 @@ class VariantInput(BaseModel):
     # una chiamata che non lo passa (test preesistenti, chiamate dirette) non
     # deve rompersi.
     collection_status: Optional[dict] = None
+
+    # CODE-31: zona non autenticata. Le chiavi finivano nella rationale della guardia e qualunque valore «vero»
+    # (anche la stringa "false") dichiarava fallita una sezione: solo le sezioni che l'orchestrator dichiara, con un
+    # booleano.
+    @field_validator("collection_status")
+    @classmethod
+    def _known_sections_with_a_boolean(cls, v):
+        if v is not None and any(name not in _COLLECTION_SECTIONS or not isinstance(failed, bool)
+                                 for name, failed in v.items()):
+            raise ValueError("collection_status: solo dns, cert, http, whois, reputation, con valore booleano")
+        return v
 
 
 @router.post("/classify/variant", tags=["Classification"])

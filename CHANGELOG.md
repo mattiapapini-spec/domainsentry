@@ -38,6 +38,15 @@ All notable changes to this project will be documented in this file.
   Python Software Foundation License.
 
 ### Fixed
+- **`collection_status` of `/classify/variant`, in the unauthenticated zone, was a free dictionary
+  (`CODE-31`).** Any key of any length was accepted and ended in the rationale of the collection
+  guard (`CODE-30` capped it downstream), and any truthy value, the string `"false"` included,
+  declared a section failed. **What changes.** Only `dns`, `cert`, `http`, `whois` and `reputation`
+  are accepted, each with a boolean; anything else is rejected with 422, also inside
+  `/classify/batch`. The orchestrator sends only those keys with booleans, so nothing changes for it.
+  The two `CODE-30` tests that classified with a 2,000-character key now check that the key is
+  rejected; the cap on the template stays as defence in depth. 18 regression tests in
+  `tests/test_collection_status_validated_code31.py`.
 - **The orchestrator put the domain into the URLs of the internal services without encoding it
   (`SEC-14`).** `/dns`, `/cert`, `/http`, `/whois`, `/reputation`, the dnstwist call and the WHOIS-only
   lookup of a dormant homoglyph were built as `?domain={domain}&…`: a `&`, `#` or `?` in the name
