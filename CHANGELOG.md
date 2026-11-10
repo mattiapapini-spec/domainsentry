@@ -38,6 +38,21 @@ All notable changes to this project will be documented in this file.
   Python Software Foundation License.
 
 ### Fixed
+- **A variant found by dnstwist kept the fixed `needs_review` label whenever its intel was not
+  collected, and the classifier was never asked (`CODE-17`).** Without `variant_intel`, and with it
+  for a variant that does not resolve and is not a homoglyph, the event carried the discovery
+  placeholder (`dnstwist_discovery`, confidence `low`): the rules on the name alone, such as the
+  script mixing of a homoglyph, never applied to these variants. **What changes.** Such a variant is
+  sent to `/classify/variant` with its name and fuzzer, an empty `collection_status` and, for a
+  homoglyph, the WHOIS already observed in an earlier cycle (`SCO-05`, no network call): no module is
+  declared, so nothing that was not collected is read as absent. A homoglyph with mixed scripts and no
+  known WHOIS now becomes `suspicious` (HIGH case severity) also without `variant_intel`, while one
+  whose known WHOIS predates the campaign stays LOW; a variant that no rule matches stays
+  `needs_review`, with the classifier's rule instead of the placeholder. The call has the 10 s
+  timeout of the classification of the feed domains, one call per variant. If the classifier fails
+  or does not answer, the placeholder stays and the event is still published. On the first cycle
+  after the update, homoglyph variants of a client may move from MEDIUM to HIGH. 8 regression tests in
+  `tests/test_variant_discovery_classified_code17.py`.
 - **A certificate name that was not a string made `/classify/variant` fail with a 500, and the domain
   stayed without a classification for that cycle (`CODE-18`).** crt.sh can return
   `"common_name": null`: when that is the only certificate name of a domain, `cert_intel` passes

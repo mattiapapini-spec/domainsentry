@@ -1110,6 +1110,36 @@ def _run_pipeline(req: TriggerRequest):
                                         logger.warning(f"    [TWIST-WHOIS-ONLY] {sanitize_log_input(vdomain)} "
                                                        f"error: {sanitize_log_input(str(e))}")
 
+                                elif vdomain:
+                                    # CODE-17: senza intel la variante passa comunque dal classificatore, col solo
+                                    # nome: le regole sul nome (omografi) valgono anche qui. Nessun modulo è
+                                    # dichiarato, quindi niente di non raccolto viene letto come assente. Per un
+                                    # omografo il WHOIS già noto (SCO-05, nessuna chiamata di rete), così un dominio
+                                    # vecchio non diventa HIGH solo perché questo ciclo non raccoglie. Se il
+                                    # classificatore non risponde resta il segnaposto di discovery; la scadenza è
+                                    # quella della classificazione dei domini del feed, una chiamata per variante.
+                                    whois_data = (_cached_homoglyph_whois(client, vdomain)
+                                                  if variant.get("fuzzer") == "homoglyph" else None)
+                                    try:
+                                        vcr = _session.post(f"{CLASSIFY_URL}/classify/variant", json={
+                                            "domain": vdomain,
+                                            "fuzzer": variant.get("fuzzer", ""),
+                                            "whois": whois_data,
+                                            "collection_status": {},
+                                        }, timeout=10)
+                                        if vcr.ok:
+                                            vcls = vcr.json()
+                                            event["classification"] = {
+                                                "auto_classification": vcls.get("auto_classification", "needs_review"),
+                                                "rule": vcls.get("rule", "dnstwist_discovery"),
+                                                "confidence": vcls.get("confidence", "low"),
+                                                "rationale": vcls.get("rationale") or
+                                                             f"Variante {variant.get('fuzzer','')} di {legit}",
+                                            }
+                                    except Exception as e:
+                                        logger.warning(f"    [TWIST-CLASSIFY] {sanitize_log_input(vdomain)} "
+                                                       f"error: {sanitize_log_input(str(e))}")
+
                                 all_events.append(event)
                     except Exception as e:
                         logger.error(f"  dnstwist error: {e}")
