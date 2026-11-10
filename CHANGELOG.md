@@ -38,6 +38,15 @@ All notable changes to this project will be documented in this file.
   Python Software Foundation License.
 
 ### Fixed
+- **No limit on the `dig` processes of the whole service (`PERF-04`, process cap only).** After
+  `SEC-29` one `/dns` request starts up to 10 `dig` at once, 7 already with `full=false`, and
+  concurrent requests multiplied them with no ceiling. **What changes.** At most `DIG_MAX_PROCESSES`
+  (20, two complete requests) run in the whole process. A query that finds no place within the time
+  it has left is `unknown`, like every query without an answer, never "no record"; the wait for a
+  place is taken from the time of the process, so the deadline of `SEC-29` stays that of the request,
+  and with a free place the process ceiling is the same as before. The capacity filter of `PERF-04`
+  (with `PERF-02` and `PERF-08`) is not part of this change. 5 regression tests in
+  `tests/test_dig_process_cap_perf04.py`.
 - **An error answer from an intelligence service became "no data" without a line in the log
   (`CODE-71`).** `_fetch_service` returned `None` for any answer that was not ok, and only exceptions
   were logged: a 500 from `/http` could not be told from a service with nothing to say. **What

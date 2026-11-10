@@ -160,6 +160,12 @@ def is_valid(records: list[str]) -> bool:
 # stesso testo in dig 9.16/9.18/9.20 e si ancorano a inizio riga: nel presentation
 # format un owner o un rdata che le imitasse non inizia mai per `;` (un TXT/CAA
 # esce tra virgolette, una label con `;` come `\;`), quindi resta un record.
+# PERF-04 (tetto ai processi `dig`): dopo SEC-29 una richiesta `/dns` avvia fino a 10 `dig` insieme, 7 già con
+# `full=false`, e richieste concorrenti li moltiplicavano senza limite. In tutto il processo ne girano al più
+# `DIG_MAX_PROCESSES`, due richieste complete: una query che non trova un posto entro il tempo che le resta è
+# `unknown`. Costante di modulo, come le soglie di SEC-35: non si configura da ambiente.
+DIG_MAX_PROCESSES = 20
+_DIG_SLOTS = threading.BoundedSemaphore(DIG_MAX_PROCESSES)
 _DIG_HEADER_RE = re.compile(r";; ->>HEADER<<- opcode: QUERY, status: ([A-Za-z0-9_]+), id: [0-9]+")
 _DIG_FLAGS_RE = re.compile(r";; flags:[^;]*; QUERY: [0-9]+, ANSWER: ([0-9]+),")
 
@@ -181,10 +187,24 @@ def dig_lookup(fqdn: str, rtype: str, timeout: int = 10, *, limit: float | None 
         # `not limit > 0` e non `limit <= 0`: anche un NaN vale "nessun tempo residuo".
         if limit is not None and not limit > 0:
             return "unknown", []
-        proc = subprocess.run(
-            ["dig", "+noall", "+comments", "+answer", "+nottlid", "+noclass",
-             "+ndots=1", f"+time={timeout}", "+tries=2", "+noidnout", fqdn, rtype],
-            capture_output=True, text=True, timeout=timeout + 10 if limit is None else min(timeout + 10, limit))
+        # PERF-04: il posto si aspetta al più fino allo stesso tetto del processo, e l'attesa si toglie dal tempo del
+        # processo: la scadenza di SEC-29 resta quella della richiesta. Con un posto libero il tetto è quello di prima.
+        ceiling = timeout + 10 if limit is None else min(timeout + 10, limit)
+        waited_since = None
+        if not _DIG_SLOTS.acquire(blocking=False):
+            waited_since = time.monotonic()
+            if not _DIG_SLOTS.acquire(timeout=ceiling):
+                return "unknown", []
+        try:
+            remaining = ceiling if waited_since is None else ceiling - (time.monotonic() - waited_since)
+            if not remaining > 0:
+                return "unknown", []
+            proc = subprocess.run(
+                ["dig", "+noall", "+comments", "+answer", "+nottlid", "+noclass",
+                 "+ndots=1", f"+time={timeout}", "+tries=2", "+noidnout", fqdn, rtype],
+                capture_output=True, text=True, timeout=remaining)
+        finally:
+            _DIG_SLOTS.release()
         # Come COL-08: rc != 0 (9 nessuna risposta, 10 errore fatale) non è una risposta.
         if proc.returncode != 0:
             return "unknown", []
