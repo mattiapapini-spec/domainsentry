@@ -38,6 +38,11 @@ All notable changes to this project will be documented in this file.
   Python Software Foundation License.
 
 ### Fixed
+- **A `/diff` that answered with an HTTP error left no line in the log (`CODE-43`).** `_persist_intel`
+  logged only the exceptions of the call: with a 500 the comparison with the previous cycle was lost
+  without a trace. **What changes.** An error answer (4xx or 5xx) logs a warning with the domain and the status.
+  The snapshot is still overwritten in that case, as before: keeping the change for the next cycle is
+  part of `COL-29`. 5 regression tests in `tests/test_persist_intel_diff_log_code43.py`.
 - **With `INTEL_STORE=false` the pipeline still wrote snapshots and history for dnstwist variants
   (`OPS-06`).** The loop over the feed domains checked the flag; the `variant_intel` branch called
   `_persist_intel` for every resolving variant anyway, which saved the snapshot under `INTEL_DIR` and,

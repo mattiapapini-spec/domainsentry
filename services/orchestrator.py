@@ -798,6 +798,9 @@ def _persist_intel(client: str, domain: str, legitimate: str, intel: dict):
                 diff = dr.json()
                 if intel_store.append_history(client, domain, diff):
                     logger.info(f"  intel diff: {diff.get('alert_count',0)} change(s) — {sanitize_log_input(diff.get('max_severity','CLEAN'))}")
+            else:
+                # CODE-43: prima solo le eccezioni lasciavano traccia, un errore HTTP no.
+                logger.warning(f"  diff error: {sanitize_log_input(domain)} HTTP {dr.status_code}")
         except Exception as e:
             logger.warning(f"  diff error: {sanitize_log_input(str(e))}")
 
