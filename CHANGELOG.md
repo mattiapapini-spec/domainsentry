@@ -38,6 +38,21 @@ All notable changes to this project will be documented in this file.
   Python Software Foundation License.
 
 ### Fixed
+- **Hidden inputs were still read with a text scan after forms, iframes and pixels had moved to the
+  tokenizer, so a page could hide them or report them wrong (`CLS-01u`).** Valid markup could keep a
+  hidden input out of the scan, names and values were cut short, and inputs that the browser does not
+  treat as hidden were counted. **What changes.** `detect_hidden_elements` reads `<input>`
+  from the same single parse as forms, iframes and pixels (`SEC-48`, no second pass on the page): an
+  input is hidden when its first `type` is `hidden` in any case; `name` and `value` are the whole
+  values as the browser submits them (entities decoded), without control characters, the name capped
+  at 300 characters and the value at 100 as before. As for the other tokenizer categories, inputs in
+  HTML comments, in the fallback content of a closed `<iframe>` and inside `<script>`/`<style>` are not
+  live markup and are no longer counted. The inputs collected by the parse never count as dead markup
+  (`CLS-01z` still reads only iframes, forms and images). The random corpus of
+  `test_http_body_analysis_sec47.py` checks only the lists read by regex, so `hidden_inputs` leaves it
+  (45 of its 80 expected signatures recomputed): on those 80 documents and on the 9 readable pages
+  every other list is identical before and after. 15 regression tests in
+  `tests/test_hidden_inputs_cls01u.py`.
 - **A request to `/reputation` could take up to about 105 s, while the orchestrator gives up after
   45 s; the abandoned request still spent a VirusTotal quota slot and the OTX and SecurityTrails
   calls on a result that was lost, and the domain lost its reputation section and became

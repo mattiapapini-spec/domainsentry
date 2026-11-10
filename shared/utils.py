@@ -769,8 +769,6 @@ _STYLE_OPEN = re.compile(r'<style', re.IGNORECASE)
 _STYLE_CLOSE = re.compile(r'</style>', re.IGNORECASE)
 _TITLE_OPEN = re.compile(r'<title', re.IGNORECASE)
 _TITLE_CLOSE = re.compile(r'</title>', re.IGNORECASE)
-_INPUT_OPEN = re.compile(r'<input', re.IGNORECASE)
-_TYPE_HIDDEN = re.compile(r'type\s*=\s*["\']?hidden', re.IGNORECASE)
 _META_OPEN = re.compile(r'<meta', re.IGNORECASE)
 _META_EQUIV_REFRESH = re.compile(r'http-equiv\s*=\s*["\']?refresh', re.IGNORECASE)
 _CONTENT_WORD = re.compile(r'content', re.IGNORECASE)
@@ -883,21 +881,6 @@ _TAG_TOKEN_SCANS = {
                        ("<input", r"type=[\\\"']?password"),
                        ("<input", r"type=[\\\"']?email"))
 }
-
-
-def _hidden_input_tags(html):
-    r"""`re.findall(r'<input[^>]*type\s*=\s*["\']?hidden["\']?[^>]*>', html, re.IGNORECASE)`."""
-    tags, pos = [], 0
-    while True:
-        tag = _INPUT_OPEN.search(html, pos)
-        if tag is None:
-            return tags
-        gt = html.find('>', tag.end())
-        if gt < 0:
-            return tags
-        if _TYPE_HIDDEN.search(html, tag.end(), gt):
-            tags.append(html[tag.start():gt + 1])
-        pos = gt + 1
 
 
 def _meta_refresh_contents(html):
@@ -1531,7 +1514,8 @@ def _collect_dead_markup(collector, self_domain):
 
     # ── Caso (a): fallback content opaco ──
     for t in collector.tags:
-        if not t["_opaque"]:
+        # CLS-01u: il collector raccoglie anche gli `<input>`, che non sono markup morto.
+        if not t["_opaque"] or t["name"] not in _DEAD_MARKUP_TAGS:
             continue
         url = _dead_markup_url(t["name"], t["attrs"])
         host = _dead_markup_external_host(url, _self)
@@ -1714,29 +1698,34 @@ def detect_hidden_elements(html: str, self_domain: str = None) -> dict:
     # Normalizza il dominio del sito stesso (per escludere risorse self-hosted)
     _self = _strip_www(self_domain)
 
-    # ── 1. Hidden input fields ──
-    hidden_inputs = _hidden_input_tags(html)
-    for inp in hidden_inputs:
-        name = re.search(r'name\s*=\s*["\']?([^"\'>\s]+)', inp, re.IGNORECASE)
-        value = re.search(r'value\s*=\s*["\']?([^"\'>\s]*)', inp, re.IGNORECASE)
-        findings["hidden_inputs"].append({
-            "tag": inp[:200],
-            "name": name.group(1) if name else None,
-            "value": (value.group(1)[:100] if value else None)
-        })
-
     # SEC-48: un solo parsing per form, iframe, img e markup morto invece di uno per insieme di tag. I tag non opachi
     # di un nome sono quelli di un parsing dedicato: le regioni opache dipendono solo dagli `<iframe>`, non dai tag
     # richiesti. I tag opachi si scartano a ogni uso, non nel collector: restano nella sua lista finché il parsing non
     # stabilisce se l'iframe che li contiene si chiude. Col parser a costo limitato si assegna il buffer e si chiama
     # solo `close` (la prova all'import ne ha verificato l'uso): `feed` si fermerebbe su un tag che non si chiude e
     # `close` lo leggerebbe di nuovo da capo.
-    dead_markup_collector = _TagCollector(_DEAD_MARKUP_TAGS)
+    # CLS-01u: lo stesso parsing raccoglie anche gli `<input>`.
+    dead_markup_collector = _TagCollector(_DEAD_MARKUP_TAGS + ("input",))
     if _HTML_PARSER_FALLBACK is None:
         dead_markup_collector.rawdata = html
     else:
         dead_markup_collector.feed(html)
     dead_markup_collector.close()
+
+    # ── 1. Hidden input fields ──
+    # CLS-01u: dal tokenizer, come form, iframe e pixel. La scansione testuale chiudeva il tag al primo `>` anche
+    # dentro un valore quotato (l'input dopo spariva), troncava nome e valore al primo spazio o apice, e contava
+    # `type=hidden` anche dentro un altro attributo o in un `type` ripetuto, che il browser ignora.
+    for inp in (t for t in dead_markup_collector.tags if t["name"] == "input" and not t["_opaque"]):
+        attrs = inp["attrs"]
+        if (attrs.get("type") or "").lower() != "hidden":
+            continue
+        value = _cap_ioc(attrs.get("value"))
+        findings["hidden_inputs"].append({
+            "tag": inp["text"][:200],
+            "name": _cap_ioc(attrs.get("name")),
+            "value": value[:100] if value is not None else None,
+        })
 
     # ── 2. Hidden forms (display:none, visibility:hidden, opacity:0) ──
     # CLS-01h: stessa migrazione del punto 3 (CLS-01g) — i vecchi pattern regex
