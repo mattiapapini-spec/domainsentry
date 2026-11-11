@@ -38,6 +38,18 @@ All notable changes to this project will be documented in this file.
   Python Software Foundation License.
 
 ### Fixed
+- **The WHOIS service waited for its turn while holding the rate lock, so concurrent requests queued
+  without limit (`PERF-02`, WHOIS part).** `whois_check` slept until `WHOIS_DELAY` had passed since the
+  last query with `_rate_lock` held: concurrent requests lined up one behind the other, each holding a
+  thread of the pool that the unified process shares with the dashboard and the login, and the k-th
+  waited about k × `WHOIS_DELAY` with no bound. **What changes.** The turn is booked under the lock and
+  waited for outside it, on the monotonic clock (a step back of the system clock would otherwise block
+  the queries for as long as the step); the minimum spacing between two queries stays `WHOIS_DELAY`. A
+  request that would wait more than `WHOIS_MAX_WAIT_S` (12 s) answers at once with a fixed error, not
+  cached: the module is not collected and the previous cycle is carried over, as for VirusTotal
+  without a quota slot (`PERF-05`). Worst case of a request: 12 s of turn, 15 s of lookup and 8 + 8 s
+  for the parsing child, 43 s against the 45 s of the orchestrator. The reputation side was already
+  bounded by `PERF-05`. 6 regression tests in `tests/test_whois_rate_wait_perf02.py`.
 - **No limit on the `dig` processes of the whole service (`PERF-04`, process cap only).** After
   `SEC-29` one `/dns` request starts up to 10 `dig` at once, 7 already with `full=false`, and
   concurrent requests multiplied them with no ceiling. **What changes.** At most `DIG_MAX_PROCESSES`
