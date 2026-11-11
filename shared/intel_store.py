@@ -52,12 +52,18 @@ def load_snapshot(client: str, domain: str) -> dict | None:
     return None
 
 
-def save_snapshot(client: str, domain: str, intel: dict) -> bool:
-    """Overwrite the current full intel snapshot for a domain."""
+def save_snapshot(client: str, domain: str, intel: dict, diff_baseline: dict | None = None) -> bool:
+    """Overwrite the current full intel snapshot for a domain.
+
+    COL-29: `diff_baseline` is the intel of the last cycle whose diff succeeded, kept when this cycle's diff
+    failed, so that the next diff still compares against it and the change is not lost. None: no pending
+    baseline (the snapshot itself is the baseline)."""
     try:
         d = SNAP_DIR / _safe(client)
         d.mkdir(parents=True, exist_ok=True)
         record = {"domain": domain, "client": client, "updated_at": _now(), "intel": intel}
+        if diff_baseline is not None:
+            record["diff_baseline"] = diff_baseline
         tmp = d / f"{_safe(domain)}.json.tmp"
         final = d / f"{_safe(domain)}.json"
         tmp.write_text(json.dumps(record), encoding="utf-8")
@@ -110,6 +116,9 @@ def load_history(client: str, domain: str, limit: int = 100) -> list:
 def get_intel(client: str, domain: str) -> dict:
     """Combined view: current snapshot + diff history for a domain."""
     snap = load_snapshot(client, domain)
+    if snap is not None:
+        # COL-29: the pending diff baseline is bookkeeping of the pipeline, not part of the view.
+        snap = {k: v for k, v in snap.items() if k != "diff_baseline"}
     return {
         "domain": domain,
         "client": client,
