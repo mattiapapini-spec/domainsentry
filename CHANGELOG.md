@@ -38,6 +38,22 @@ All notable changes to this project will be documented in this file.
   Python Software Foundation License.
 
 ### Fixed
+- **The orchestrator lost results without saying so when classification, diff, event publishing or
+  discovery failed (`COL-29`).** A domain whose classification failed disappeared from the events of
+  the cycle; a failed `/diff` (or a history that could not be written) let the snapshot be
+  overwritten, and the change of that cycle never came out; "Pubblicati N eventi" was logged also
+  when `/publish` answered with an error; a dnstwist HTTP error left no trace; and the run ended
+  `done` with nothing to show. **What changes.** A domain whose classifier did not answer still
+  reaches the events, with the fallback classification `needs_review` and rule
+  `classification_unavailable`; that event is not ingested as a case, since it would overwrite the
+  classification of open cases. After a failed diff the snapshot is still updated (invalid data must
+  not stop it, `COL-16`, and a diff that fails on the same data would fail at every cycle), but it
+  keeps the baseline of the last successful diff (`diff_baseline`, not shown by `/intel`): the next
+  diff starts from there and the change comes out then; a diff without changes is not a failure.
+  Failed publishing and failed discovery are logged, the log of the classifier and dnstwist errors
+  is sanitized, and every failure of the run is counted in `/progress` under `failures`
+  (`classification`, `diff`, `publish`, `discovery`). 17 regression tests in
+  `tests/test_pipeline_failures_col29.py`.
 - **With the capacity filter alone, an anonymous flood on the collectors also took the places the
   legitimate scan needs (`PERF-08`, with the accounting of abandoned scan requests).** **What
   changes.** 8 places are reserved to the requests of the orchestrator, recognised by the

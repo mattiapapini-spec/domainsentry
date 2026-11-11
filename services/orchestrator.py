@@ -87,6 +87,8 @@ _progress = {
     "started_at": None,
     "finished_at": None,
     "events": 0,
+    # COL-29: i fallimenti del ciclo, prima invisibili (la fase finiva «done» comunque).
+    "failures": {"classification": 0, "diff": 0, "publish": 0, "discovery": 0},
 }
 _log_buffer = []
 _last_heartbeat = 0.0  # monotonic time of the last progress update; detects dead pipelines
@@ -106,9 +108,25 @@ def _progress_reset(client, total):
             "running": True, "phase": "starting", "client": client or "all",
             "current_domain": None, "done": 0, "total": total,
             "started_at": now_iso(), "finished_at": None, "events": 0,
+            "failures": {"classification": 0, "diff": 0, "publish": 0, "discovery": 0},
         })
         _last_heartbeat = time.time()
         _log_buffer.clear()
+
+def _count_failure(kind):
+    """COL-29: conta un fallimento del ciclo in corso (`failures` di /progress)."""
+    with _lock:
+        _progress["failures"][kind] += 1
+
+
+# COL-29: la classificazione di un dominio il cui classificatore non ha risposto. L'evento esce lo stesso, così il
+# dominio non sparisce dal ciclo, ma non passa dai casi: riscriverebbe la classificazione dei casi aperti.
+CLASSIFICATION_UNAVAILABLE_RULE = "classification_unavailable"
+_CLASSIFICATION_UNAVAILABLE = {
+    "auto_classification": "needs_review", "confidence": "low", "rule": CLASSIFICATION_UNAVAILABLE_RULE,
+    "rationale": "Classificazione non disponibile in questo ciclo: il classificatore non ha risposto. Verifica manuale",
+}
+
 
 def _plog(msg):
     """Append a line to the in-memory log buffer (and the normal logger)."""
@@ -171,6 +189,7 @@ def progress(include_log: bool = True):
     """
     with _lock:
         state = dict(_progress)
+        state["failures"] = dict(_progress["failures"])
         state["log"] = list(_log_buffer) if include_log else []
     # Derive a percentage when we have a total to compare against
     total = state.get("total") or 0
@@ -735,6 +754,10 @@ def _persist_intel(client: str, domain: str, legitimate: str, intel: dict):
     """
     prev = intel_store.load_snapshot(client, domain)
     prev_intel = (prev or {}).get("intel") if prev else None
+    # COL-29: dopo un diff fallito lo snapshot ha conservato la baseline dell'ultimo diff riuscito: il diff di
+    # questo ciclo parte da lì, così la variazione del ciclo fallito non si perde.
+    pending = (prev or {}).get("diff_baseline") if isinstance(prev, dict) else None
+    diff_baseline = pending if isinstance(pending, dict) else prev_intel
 
     # Build the comparable intel object (exclude classification — that's separate).
     # A module that failed or errored must NOT overwrite a healthy baseline:
@@ -789,22 +812,37 @@ def _persist_intel(client: str, domain: str, legitimate: str, intel: dict):
         current["dns"] = _mark_kept_names({**prev_dns, "carried_over": marker} if marker else prev_dns, carried_at)
 
     # Only diff if we have a previous snapshot to compare against
+    diff_failed = False
     if prev_intel:
         try:
             dr = _session.post(f"{CLASSIFY_URL}/diff", json={
                 "domain": domain, "client": client, "legitimate": legitimate,
-                "baseline": prev_intel, "current": current,
+                "baseline": diff_baseline, "current": current,
             }, timeout=15)
             if dr.ok:
                 diff = dr.json()
                 if intel_store.append_history(client, domain, diff):
                     logger.info(f"  intel diff: {diff.get('alert_count',0)} change(s) — {sanitize_log_input(diff.get('max_severity','CLEAN'))}")
+                elif diff.get("alerts"):
+                    # `append_history` restituisce False anche senza variazioni: un guasto solo se ce n'erano.
+                    diff_failed = True
             else:
                 # CODE-43: prima solo le eccezioni lasciavano traccia, un errore HTTP no.
                 logger.warning(f"  diff error: {sanitize_log_input(domain)} HTTP {dr.status_code}")
+                diff_failed = True
         except Exception as e:
             logger.warning(f"  diff error: {sanitize_log_input(str(e))}")
+            diff_failed = True
 
+    if diff_failed:
+        # COL-29: lo snapshot si aggiorna comunque (COL-16: dati non validi non lo fermano, e un diff che fallisce
+        # sugli stessi dati fallirebbe a ogni ciclo), ma conserva la baseline dell'ultimo diff riuscito: il diff del
+        # ciclo dopo parte da lì e la variazione di questo ciclo esce allora.
+        logger.warning(f"  diff di {sanitize_log_input(domain)} non riuscito: lo snapshot conserva la baseline "
+                       f"dell'ultimo diff riuscito, la variazione uscirà al prossimo")
+        _count_failure("diff")
+        intel_store.save_snapshot(client, domain, current, diff_baseline=diff_baseline)
+        return
     intel_store.save_snapshot(client, domain, current)
 
 
@@ -829,6 +867,8 @@ def _ingest_cases(events: list):
         if legitimate and ev.get("domain") == legitimate:
             continue
         cls = ev.get("classification") or {}
+        if cls.get("rule") == CLASSIFICATION_UNAVAILABLE_RULE:
+            continue
         category = cls.get("auto_classification", "needs_review")
         payload = {
             "domain": ev.get("domain"),
@@ -925,10 +965,18 @@ def _run_pipeline(req: TriggerRequest):
                         "reputation": intel.get("reputation"),
                         "collection_status": _build_collection_status(intel, requested_modules),
                     }, timeout=10)
-                    intel["classification"] = cr.json() if cr.ok else None
+                    if cr.ok:
+                        intel["classification"] = cr.json()
+                    else:
+                        logger.warning(f"  Classification error: {sanitize_log_input(domain)} HTTP {cr.status_code}")
+                        intel["classification"] = None
                 except Exception as e:
-                    logger.error(f"  Classification error: {e}")
+                    logger.error(f"  Classification error: {sanitize_log_input(domain)}: {sanitize_log_input(str(e))}")
                     intel["classification"] = None
+                if not intel["classification"]:
+                    # COL-29: senza classificazione il dominio spariva dagli eventi del ciclo.
+                    _count_failure("classification")
+                    intel["classification"] = dict(_CLASSIFICATION_UNAVAILABLE)
 
                 # Persist full intel snapshot + baseline diff history (opt-in).
                 # Fail-safe: storage/diff errors never break the pipeline.
@@ -983,6 +1031,10 @@ def _run_pipeline(req: TriggerRequest):
                     _plog(f"  [TWIST] {legit}")
                     try:
                         tr = _session.get(f"{TWIST_URL}/twist?domain={quote(legit, safe='')}", timeout=300)
+                        if not tr.ok:
+                            # COL-29: prima un errore HTTP di dnstwist non lasciava traccia.
+                            logger.warning(f"  [TWIST] {sanitize_log_input(legit)} error: HTTP {tr.status_code}")
+                            _count_failure("discovery")
                         if tr.ok:
                             twist_data = tr.json()
                             variant_count = twist_data.get('registered_variants', 0)
@@ -1148,15 +1200,22 @@ def _run_pipeline(req: TriggerRequest):
 
                                 all_events.append(event)
                     except Exception as e:
-                        logger.error(f"  dnstwist error: {e}")
+                        logger.error(f"  dnstwist error: {sanitize_log_input(str(e))}")
+                        _count_failure("discovery")
 
         # Pubblica eventi
         if all_events:
             try:
-                _session.post(f"{EVENT_URL}/publish", json={"events": all_events}, timeout=10)
-                _plog(f"Pubblicati {len(all_events)} eventi")
+                pr = _session.post(f"{EVENT_URL}/publish", json={"events": all_events}, timeout=10)
+                if pr.ok:
+                    _plog(f"Pubblicati {len(all_events)} eventi")
+                else:
+                    # COL-29: «Pubblicati N» usciva anche con un errore HTTP.
+                    logger.error(f"Event publish error: HTTP {pr.status_code}, {len(all_events)} eventi non pubblicati")
+                    _count_failure("publish")
             except Exception as e:
-                logger.error(f"Event publish error: {e}")
+                logger.error(f"Event publish error: {sanitize_log_input(str(e))}")
+                _count_failure("publish")
 
             # Ingest automatico nei case (opt-in via CASE_INGEST=true).
             # Trasforma ogni evento in un case gestibile dal case-manager.
