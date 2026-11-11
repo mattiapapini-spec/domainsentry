@@ -38,6 +38,18 @@ All notable changes to this project will be documented in this file.
   Python Software Foundation License.
 
 ### Fixed
+- **In the unified process, slow requests to the collectors could take every thread and make the rest
+  of the service unreachable, health probe included (`PERF-04`, capacity filter).** The synchronous
+  handlers of every service share the 40 threads of the anyio pool. Measured on the code before this
+  change: with 45 concurrent `/whois` requests of 1.5 s each, `/health` answered after 1.06 s instead
+  of at once. **What changes.** An ASGI filter in `unified.py`, before the thread pool, admits at most
+  20 requests to `/dns`, `/cert`, `/http`, `/whois` and `/reputation` together, 8 per collector and
+  4 for reputation; the others get a 503 with `Retry-After: 5` at once, without taking a thread, and
+  the refusals are logged at most once every 10 s with their counts. A place comes back when the
+  handler really ends, not when the caller stops waiting, since its thread is busy until then. The
+  other paths do not go through the filter. In this change the scan of the orchestrator counts like
+  any other caller: its reserve is `PERF-08`. The split deployment (`docker-compose.prod.yml`) is
+  not affected. 18 regression tests in `tests/test_unified_capacity_perf04.py`.
 - **The WHOIS service waited for its turn while holding the rate lock, so concurrent requests queued
   without limit (`PERF-02`, WHOIS part).** `whois_check` slept until `WHOIS_DELAY` had passed since the
   last query with `_rate_lock` held: concurrent requests lined up one behind the other, each holding a
