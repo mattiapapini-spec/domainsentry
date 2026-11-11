@@ -12,14 +12,18 @@ For production with separate containers:
 
 import os
 import logging
+import threading
+import time
 from datetime import datetime, timezone
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
 # Import routers from all services
 from services.dns_intel import router as dns_router
 from services.cert_intel import router as cert_router
 from services.http_fingerprint import router as http_router
 from services.whois_intel import router as whois_router
+from services import whois_intel as _whois_intel
 from services.reputation import router as rep_router
 from services.dnstwist_engine import router as twist_router
 from services.classifier import router as classify_router
@@ -50,6 +54,113 @@ app = FastAPI(
     ]
 )
 apply_security(app)
+
+
+# ── PERF-04: capacità dei collettori ──
+# I gestori sincroni di tutti i servizi (collettori, dashboard, login, `/health`) condividono i 40 thread del pool di
+# anyio. Richieste lente ai cinque collettori li occupavano tutti, e il resto del servizio aspettava. Il filtro ammette
+# al più COLLECTOR_CAPACITY_TOTAL richieste ai collettori insieme, e per collettore i posti di
+# COLLECTOR_CAPACITY_EACH: le altre ricevono subito un 503, senza prendere un thread. Il posto torna libero quando il
+# gestore finisce davvero (`await` dell'app), non quando il chiamante smette di aspettare: il thread è occupato
+# fino ad allora. Costanti di modulo, come le soglie di SEC-35.
+COLLECTOR_PATHS = {"/dns": "dns", "/cert": "cert", "/http": "http", "/whois": "whois", "/reputation": "reputation"}
+COLLECTOR_CAPACITY_TOTAL = 20
+
+
+def _whois_places():
+    """Ogni `/whois` ammesso prenota un turno distanziato di WHOIS_DELAY e oltre WHOIS_MAX_WAIT_S risponde senza
+    raccogliere (PERF-02): con più richieste in coda di quante ne stiano nel tetto d'attesa, anche quella della
+    scansione resterebbe senza turno. I posti lasciano due turni di margine: 4 con i valori di default."""
+    if _whois_intel.WHOIS_DELAY <= 0:
+        return 8
+    return max(1, min(8, int(_whois_intel.WHOIS_MAX_WAIT_S // _whois_intel.WHOIS_DELAY) - 2))
+
+
+COLLECTOR_CAPACITY_EACH = {"dns": 8, "cert": 8, "http": 8, "whois": _whois_places(), "reputation": 4}
+
+
+class _CollectorCapacity:
+    """Posti occupati dalle richieste ai collettori, in tutto e per collettore."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.reset()
+
+    def reset(self):
+        with self._lock:
+            self._total = 0
+            self._each = dict.fromkeys(COLLECTOR_CAPACITY_EACH, 0)
+            self._refused, self._last_log = {}, float("-inf")
+
+    def take(self, collector):
+        with self._lock:
+            if self._total >= COLLECTOR_CAPACITY_TOTAL or self._each[collector] >= COLLECTOR_CAPACITY_EACH[collector]:
+                return False
+            self._total += 1
+            self._each[collector] += 1
+            return True
+
+    def give_back(self, collector):
+        with self._lock:
+            self._total -= 1
+            self._each[collector] -= 1
+
+    def refused(self, collector, now):
+        """Conta un rifiuto; restituisce il conteggio da loggare al più una volta ogni 10 s, altrimenti None: sotto
+        un flood una riga per rifiuto riempirebbe il log."""
+        with self._lock:
+            self._refused[collector] = self._refused.get(collector, 0) + 1
+            if now - self._last_log < 10:
+                return None
+            self._last_log, counts, self._refused = now, self._refused, {}
+            return counts
+
+    def in_use(self):
+        with self._lock:
+            return self._total
+
+
+_COLLECTOR_CAPACITY = _CollectorCapacity()
+
+
+def _route_path(scope):
+    """Il percorso come lo instrada Starlette, senza il `root_path`: dietro un prefisso (`--root-path`) il percorso
+    intero non coinciderebbe e il filtro si spegnerebbe in silenzio."""
+    path, root = scope.get("path", ""), scope.get("root_path", "")
+    if not root or not path.startswith(root):
+        return path
+    if path == root:
+        return ""
+    # Come Starlette: il prefisso si toglie solo al confine di `/` (`root_path=/w` lascia `/whois` intero).
+    return path[len(root):] if path[len(root)] == "/" else path
+
+
+class CollectorCapacityMiddleware:
+    """Filtro ASGI: prima del pool di thread, quindi un rifiuto non occupa un thread."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        collector = COLLECTOR_PATHS.get(_route_path(scope)) if scope["type"] == "http" else None
+        if collector is None:
+            await self.app(scope, receive, send)
+            return
+        if not _COLLECTOR_CAPACITY.take(collector):
+            counts = _COLLECTOR_CAPACITY.refused(collector, time.monotonic())
+            if counts:
+                logger.warning("Capacità dei collettori esaurita, richieste rifiutate con 503: %s",
+                               ", ".join(f"/{name} {n}" for name, n in sorted(counts.items())))
+            await JSONResponse({"error": "collector capacity exhausted, retry later"}, status_code=503,
+                               headers={"Retry-After": "5"})(scope, receive, send)
+            return
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            _COLLECTOR_CAPACITY.give_back(collector)
+
+
+app.add_middleware(CollectorCapacityMiddleware)
 
 # ── Mount all routers ──
 app.include_router(dns_router, tags=["Intelligence"])
