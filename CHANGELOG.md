@@ -38,6 +38,18 @@ All notable changes to this project will be documented in this file.
   Python Software Foundation License.
 
 ### Fixed
+- **With the capacity filter alone, an anonymous flood on the collectors also took the places the
+  legitimate scan needs (`PERF-08`, with the accounting of abandoned scan requests).** **What
+  changes.** 8 places are reserved to the requests of the orchestrator, recognised by the
+  `X-DomainSentry-Scan` header with a random mark generated at every start of the process and never
+  exposed (compared in constant time); with the reserve full the scan uses the anonymous places. A
+  scan request older than the `SERVICE_TIMEOUT` of the orchestrator has already been abandoned, since
+  the orchestrator always gives up at that threshold, but its thread is still busy: it moves to a
+  separate count of at most 4 places, with a line in the log, and the reserve goes back to the live
+  scan. At most 20 + 8 + 4 = 32 collector requests run at once, of the 40 threads. The orchestrator
+  sends the mark from its HTTP session, so in the unified deployment every orchestrator call carries it;
+  all those URLs point to the same process there. 11 regression tests in
+  `tests/test_unified_capacity_perf08.py`.
 - **In the unified process, slow requests to the collectors could take every thread and make the rest
   of the service unreachable, health probe included (`PERF-04`, capacity filter).** The synchronous
   handlers of every service share the 40 threads of the anyio pool. Measured on the code before this

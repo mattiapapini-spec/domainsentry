@@ -10,8 +10,10 @@ For production with separate containers:
     docker compose -f docker-compose.prod.yml up -d
 """
 
+import hmac
 import os
 import logging
+import secrets
 import threading
 import time
 from datetime import datetime, timezone
@@ -29,6 +31,7 @@ from services.dnstwist_engine import router as twist_router
 from services.classifier import router as classify_router
 from services.feed_manager import router as feed_router
 from services.orchestrator import router as orch_router
+from services import orchestrator as _orchestrator
 from services.event_publisher import router as events_router
 
 # Optional: case-manager (stateful, requires CASES_DB volume).
@@ -79,36 +82,94 @@ def _whois_places():
 COLLECTOR_CAPACITY_EACH = {"dns": 8, "cert": 8, "http": 8, "whois": _whois_places(), "reputation": 4}
 
 
+# ── PERF-08 e variante B2: la riserva della scansione ──
+# Col solo tetto un flood anonimo occupava anche i posti che servono alla scansione legittima. SCAN_RESERVE posti sono
+# della scansione dell'orchestrator, riconosciuta dall'intestazione SCAN_HEADER col contrassegno casuale SCAN_TOKEN,
+# nuovo a ogni avvio del processo e mai esposto (l'orchestrator lo manda dalla propria sessione HTTP, sotto); con la
+# riserva piena la scansione usa i posti anonimi. Variante B2 (decisione di Mat): una richiesta della scansione più
+# vecchia di SCAN_ABANDON_AFTER_S, il `SERVICE_TIMEOUT` dell'orchestrator, è già stata abbandonata, perché
+# l'orchestrator rinuncia sempre a quella soglia, ma il suo thread è ancora occupato. Passa in un conto a parte con al
+# più SCAN_ABANDONED_MAX posti, con una riga nel log, e la riserva torna alla scansione viva. In tutto non sono mai in
+# corso più di COLLECTOR_CAPACITY_TOTAL + SCAN_RESERVE + SCAN_ABANDONED_MAX richieste ai collettori (32 su 40 thread).
+SCAN_HEADER = "X-DomainSentry-Scan"
+SCAN_TOKEN = secrets.token_hex(32)
+SCAN_RESERVE = 8
+SCAN_ABANDONED_MAX = 4
+SCAN_ABANDON_AFTER_S = _orchestrator.TIMEOUT
+_orchestrator._session.headers[SCAN_HEADER] = SCAN_TOKEN
+_SCAN_HEADER_KEY = SCAN_HEADER.lower().encode()
+
+
+class _Place:
+    """Un posto occupato: il collettore, il conto in cui sta (anonymous, reserve, abandoned) e quando è iniziato."""
+
+    __slots__ = ("collector", "bucket", "started")
+
+    def __init__(self, collector, bucket, started):
+        self.collector, self.bucket, self.started = collector, bucket, started
+
+
 class _CollectorCapacity:
-    """Posti occupati dalle richieste ai collettori, in tutto e per collettore."""
+    """Posti occupati dalle richieste ai collettori: anonimi (in tutto e per collettore), della riserva della
+    scansione e della scansione abbandonata."""
 
     def __init__(self):
         self._lock = threading.Lock()
+        self.clock = time.monotonic
         self.reset()
 
     def reset(self):
         with self._lock:
             self._total = 0
             self._each = dict.fromkeys(COLLECTOR_CAPACITY_EACH, 0)
+            self._reserve = []
+            self._abandoned = 0
             self._refused, self._last_log = {}, float("-inf")
 
-    def take(self, collector):
-        with self._lock:
-            if self._total >= COLLECTOR_CAPACITY_TOTAL or self._each[collector] >= COLLECTOR_CAPACITY_EACH[collector]:
-                return False
-            self._total += 1
-            self._each[collector] += 1
-            return True
+    def _take_anonymous(self, collector, now):
+        """Con `_lock` preso."""
+        if self._total >= COLLECTOR_CAPACITY_TOTAL or self._each[collector] >= COLLECTOR_CAPACITY_EACH[collector]:
+            return None
+        self._total += 1
+        self._each[collector] += 1
+        return _Place(collector, "anonymous", now)
 
-    def give_back(self, collector):
+    def take(self, collector, scan=False):
+        """Il posto ottenuto (o None) e i posti della riserva appena passati fra gli abbandonati, da loggare."""
         with self._lock:
-            self._total -= 1
-            self._each[collector] -= 1
+            now = self.clock()
+            if not scan:
+                return self._take_anonymous(collector, now), []
+            moved = []
+            for place in list(self._reserve):
+                if self._abandoned >= SCAN_ABANDONED_MAX:
+                    break
+                if now - place.started > SCAN_ABANDON_AFTER_S:
+                    self._reserve.remove(place)
+                    place.bucket = "abandoned"
+                    self._abandoned += 1
+                    moved.append((place.collector, now - place.started))
+            if len(self._reserve) < SCAN_RESERVE:
+                place = _Place(collector, "reserve", now)
+                self._reserve.append(place)
+                return place, moved
+            return self._take_anonymous(collector, now), moved
 
-    def refused(self, collector, now):
+    def give_back(self, place):
+        with self._lock:
+            if place.bucket == "anonymous":
+                self._total -= 1
+                self._each[place.collector] -= 1
+            elif place.bucket == "reserve":
+                self._reserve.remove(place)
+            else:
+                self._abandoned -= 1
+
+    def refused(self, collector):
         """Conta un rifiuto; restituisce il conteggio da loggare al più una volta ogni 10 s, altrimenti None: sotto
         un flood una riga per rifiuto riempirebbe il log."""
         with self._lock:
+            now = self.clock()
             self._refused[collector] = self._refused.get(collector, 0) + 1
             if now - self._last_log < 10:
                 return None
@@ -117,10 +178,17 @@ class _CollectorCapacity:
 
     def in_use(self):
         with self._lock:
-            return self._total
+            return self._total + len(self._reserve) + self._abandoned
 
 
 _COLLECTOR_CAPACITY = _CollectorCapacity()
+
+
+def _is_scan(scope):
+    for key, value in scope.get("headers") or ():
+        if key == _SCAN_HEADER_KEY:
+            return hmac.compare_digest(value, SCAN_TOKEN.encode())
+    return False
 
 
 def _route_path(scope):
@@ -141,8 +209,12 @@ class CollectorCapacityMiddleware:
         if collector is None:
             await self.app(scope, receive, send)
             return
-        if not _COLLECTOR_CAPACITY.take(collector):
-            counts = _COLLECTOR_CAPACITY.refused(collector, time.monotonic())
+        place, moved = _COLLECTOR_CAPACITY.take(collector, scan=_is_scan(scope))
+        for name, age in moved:
+            logger.warning("Richiesta della scansione abbandonata dall'orchestrator: /%s in corso da %.0f s, "
+                           "spostata fuori dalla riserva", name, age)
+        if place is None:
+            counts = _COLLECTOR_CAPACITY.refused(collector)
             if counts:
                 logger.warning("Capacità dei collettori esaurita, richieste rifiutate con 503: %s",
                                ", ".join(f"/{name} {n}" for name, n in sorted(counts.items())))
@@ -152,7 +224,7 @@ class CollectorCapacityMiddleware:
         try:
             await self.app(scope, receive, send)
         finally:
-            _COLLECTOR_CAPACITY.give_back(collector)
+            _COLLECTOR_CAPACITY.give_back(place)
 
 
 app.add_middleware(CollectorCapacityMiddleware)
