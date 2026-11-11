@@ -9,6 +9,7 @@ from fastapi import FastAPI, APIRouter, BackgroundTasks
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional
+from urllib.parse import quote
 import requests
 
 from shared.security import apply_security, sanitize_log_input
@@ -798,6 +799,9 @@ def _persist_intel(client: str, domain: str, legitimate: str, intel: dict):
                 diff = dr.json()
                 if intel_store.append_history(client, domain, diff):
                     logger.info(f"  intel diff: {diff.get('alert_count',0)} change(s) — {sanitize_log_input(diff.get('max_severity','CLEAN'))}")
+            else:
+                # CODE-43: prima solo le eccezioni lasciavano traccia, un errore HTTP no.
+                logger.warning(f"  diff error: {sanitize_log_input(domain)} HTTP {dr.status_code}")
         except Exception as e:
             logger.warning(f"  diff error: {sanitize_log_input(str(e))}")
 
@@ -978,7 +982,7 @@ def _run_pipeline(req: TriggerRequest):
                 for legit in legits:
                     _plog(f"  [TWIST] {legit}")
                     try:
-                        tr = _session.get(f"{TWIST_URL}/twist?domain={legit}", timeout=300)
+                        tr = _session.get(f"{TWIST_URL}/twist?domain={quote(legit, safe='')}", timeout=300)
                         if tr.ok:
                             twist_data = tr.json()
                             variant_count = twist_data.get('registered_variants', 0)
@@ -1012,7 +1016,9 @@ def _run_pipeline(req: TriggerRequest):
                                     logger.info(f"    [TWIST-INTEL] {sanitize_log_input(vdomain)}")
                                     try:
                                         vintel = _gather_intelligence(vdomain, req)
-                                        _persist_intel(client, vdomain, legit, vintel)
+                                        # OPS-06: lo stesso flag del ciclo dei domini del feed.
+                                        if INTEL_STORE:
+                                            _persist_intel(client, vdomain, legit, vintel)
                                         # SCO-05: ricorda l'ultimo WHOIS valido di un omografo
                                         # risolvente, per riusarlo (costo zero) se lo stesso
                                         # dominio torna dormiente in un ciclo successivo — v.
@@ -1085,7 +1091,7 @@ def _run_pipeline(req: TriggerRequest):
                                             and vdomain.lower() in WHOIS_ONLY_DOMAINS):
                                         logger.info(f"    [TWIST-WHOIS-ONLY] {sanitize_log_input(vdomain)}")
                                         _, whois_data = _fetch_service(
-                                            "whois", f"{WHOIS_URL}/whois?domain={vdomain}")
+                                            "whois", f"{WHOIS_URL}/whois?domain={quote(vdomain, safe='')}")
                                         collection_status = {"whois": _module_failed(whois_data)}
                                         if not collection_status["whois"]:
                                             _remember_homoglyph_whois(client, vdomain, whois_data)
@@ -1108,6 +1114,36 @@ def _run_pipeline(req: TriggerRequest):
                                             }
                                     except Exception as e:
                                         logger.warning(f"    [TWIST-WHOIS-ONLY] {sanitize_log_input(vdomain)} "
+                                                       f"error: {sanitize_log_input(str(e))}")
+
+                                elif vdomain:
+                                    # CODE-17: senza intel la variante passa comunque dal classificatore, col solo
+                                    # nome: le regole sul nome (omografi) valgono anche qui. Nessun modulo è
+                                    # dichiarato, quindi niente di non raccolto viene letto come assente. Per un
+                                    # omografo il WHOIS già noto (SCO-05, nessuna chiamata di rete), così un dominio
+                                    # vecchio non diventa HIGH solo perché questo ciclo non raccoglie. Se il
+                                    # classificatore non risponde resta il segnaposto di discovery; la scadenza è
+                                    # quella della classificazione dei domini del feed, una chiamata per variante.
+                                    whois_data = (_cached_homoglyph_whois(client, vdomain)
+                                                  if variant.get("fuzzer") == "homoglyph" else None)
+                                    try:
+                                        vcr = _session.post(f"{CLASSIFY_URL}/classify/variant", json={
+                                            "domain": vdomain,
+                                            "fuzzer": variant.get("fuzzer", ""),
+                                            "whois": whois_data,
+                                            "collection_status": {},
+                                        }, timeout=10)
+                                        if vcr.ok:
+                                            vcls = vcr.json()
+                                            event["classification"] = {
+                                                "auto_classification": vcls.get("auto_classification", "needs_review"),
+                                                "rule": vcls.get("rule", "dnstwist_discovery"),
+                                                "confidence": vcls.get("confidence", "low"),
+                                                "rationale": vcls.get("rationale") or
+                                                             f"Variante {variant.get('fuzzer','')} di {legit}",
+                                            }
+                                    except Exception as e:
+                                        logger.warning(f"    [TWIST-CLASSIFY] {sanitize_log_input(vdomain)} "
                                                        f"error: {sanitize_log_input(str(e))}")
 
                                 all_events.append(event)
@@ -1144,7 +1180,11 @@ def _fetch_service(name: str, url: str) -> tuple:
     """Single service fetch, returns (name, result_or_None)."""
     try:
         r = _session.get(url, timeout=TIMEOUT)
-        return (name, r.json() if r.ok else None)
+        if not r.ok:
+            # CODE-71: resta «nessun dato», ma con una riga: prima solo le eccezioni lasciavano traccia.
+            logger.warning(f"  {name} error: HTTP {r.status_code} ({sanitize_log_input(url)})")
+            return (name, None)
+        return (name, r.json())
     except Exception as e:
         logger.warning(f"  {name} error: {sanitize_log_input(str(e))}")
         return (name, None)
@@ -1160,16 +1200,18 @@ def _gather_intelligence(domain: str, req: TriggerRequest) -> dict:
 
     intel = {"dns": None, "cert": None, "http": None, "whois": None, "reputation": None}
 
-    # Costruisci la lista dei task da eseguire
+    # Costruisci la lista dei task da eseguire.
+    # SEC-14: il dominio entra codificato, così un `&`, `#` o `?` nel nome non cambia i parametri della chiamata.
+    q = quote(domain, safe="")
     tasks = [
-        ("dns", f"{DNS_URL}/dns?domain={domain}&full=true&subdomains=true"),
-        ("cert", f"{CERT_URL}/cert?domain={domain}"),
-        ("http", f"{HTTP_URL}/http?domain={domain}"),
+        ("dns", f"{DNS_URL}/dns?domain={q}&full=true&subdomains=true"),
+        ("cert", f"{CERT_URL}/cert?domain={q}"),
+        ("http", f"{HTTP_URL}/http?domain={q}"),
     ]
     if req.include_whois:
-        tasks.append(("whois", f"{WHOIS_URL}/whois?domain={domain}"))
+        tasks.append(("whois", f"{WHOIS_URL}/whois?domain={q}"))
     if req.include_reputation:
-        tasks.append(("reputation", f"{REP_URL}/reputation?domain={domain}"))
+        tasks.append(("reputation", f"{REP_URL}/reputation?domain={q}"))
 
     # Esegui in parallelo (guard contro tasks vuoto)
     with ThreadPoolExecutor(max_workers=max(len(tasks), 1)) as executor:

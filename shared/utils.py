@@ -160,6 +160,12 @@ def is_valid(records: list[str]) -> bool:
 # stesso testo in dig 9.16/9.18/9.20 e si ancorano a inizio riga: nel presentation
 # format un owner o un rdata che le imitasse non inizia mai per `;` (un TXT/CAA
 # esce tra virgolette, una label con `;` come `\;`), quindi resta un record.
+# PERF-04 (tetto ai processi `dig`): dopo SEC-29 una richiesta `/dns` avvia fino a 10 `dig` insieme, 7 già con
+# `full=false`, e richieste concorrenti li moltiplicavano senza limite. In tutto il processo ne girano al più
+# `DIG_MAX_PROCESSES`, due richieste complete: una query che non trova un posto entro il tempo che le resta è
+# `unknown`. Costante di modulo, come le soglie di SEC-35: non si configura da ambiente.
+DIG_MAX_PROCESSES = 20
+_DIG_SLOTS = threading.BoundedSemaphore(DIG_MAX_PROCESSES)
 _DIG_HEADER_RE = re.compile(r";; ->>HEADER<<- opcode: QUERY, status: ([A-Za-z0-9_]+), id: [0-9]+")
 _DIG_FLAGS_RE = re.compile(r";; flags:[^;]*; QUERY: [0-9]+, ANSWER: ([0-9]+),")
 
@@ -181,10 +187,24 @@ def dig_lookup(fqdn: str, rtype: str, timeout: int = 10, *, limit: float | None 
         # `not limit > 0` e non `limit <= 0`: anche un NaN vale "nessun tempo residuo".
         if limit is not None and not limit > 0:
             return "unknown", []
-        proc = subprocess.run(
-            ["dig", "+noall", "+comments", "+answer", "+nottlid", "+noclass",
-             "+ndots=1", f"+time={timeout}", "+tries=2", "+noidnout", fqdn, rtype],
-            capture_output=True, text=True, timeout=timeout + 10 if limit is None else min(timeout + 10, limit))
+        # PERF-04: il posto si aspetta al più fino allo stesso tetto del processo, e l'attesa si toglie dal tempo del
+        # processo: la scadenza di SEC-29 resta quella della richiesta. Con un posto libero il tetto è quello di prima.
+        ceiling = timeout + 10 if limit is None else min(timeout + 10, limit)
+        waited_since = None
+        if not _DIG_SLOTS.acquire(blocking=False):
+            waited_since = time.monotonic()
+            if not _DIG_SLOTS.acquire(timeout=ceiling):
+                return "unknown", []
+        try:
+            remaining = ceiling if waited_since is None else ceiling - (time.monotonic() - waited_since)
+            if not remaining > 0:
+                return "unknown", []
+            proc = subprocess.run(
+                ["dig", "+noall", "+comments", "+answer", "+nottlid", "+noclass",
+                 "+ndots=1", f"+time={timeout}", "+tries=2", "+noidnout", fqdn, rtype],
+                capture_output=True, text=True, timeout=remaining)
+        finally:
+            _DIG_SLOTS.release()
         # Come COL-08: rc != 0 (9 nessuna risposta, 10 errore fatale) non è una risposta.
         if proc.returncode != 0:
             return "unknown", []
@@ -769,8 +789,6 @@ _STYLE_OPEN = re.compile(r'<style', re.IGNORECASE)
 _STYLE_CLOSE = re.compile(r'</style>', re.IGNORECASE)
 _TITLE_OPEN = re.compile(r'<title', re.IGNORECASE)
 _TITLE_CLOSE = re.compile(r'</title>', re.IGNORECASE)
-_INPUT_OPEN = re.compile(r'<input', re.IGNORECASE)
-_TYPE_HIDDEN = re.compile(r'type\s*=\s*["\']?hidden', re.IGNORECASE)
 _META_OPEN = re.compile(r'<meta', re.IGNORECASE)
 _META_EQUIV_REFRESH = re.compile(r'http-equiv\s*=\s*["\']?refresh', re.IGNORECASE)
 _CONTENT_WORD = re.compile(r'content', re.IGNORECASE)
@@ -883,21 +901,6 @@ _TAG_TOKEN_SCANS = {
                        ("<input", r"type=[\\\"']?password"),
                        ("<input", r"type=[\\\"']?email"))
 }
-
-
-def _hidden_input_tags(html):
-    r"""`re.findall(r'<input[^>]*type\s*=\s*["\']?hidden["\']?[^>]*>', html, re.IGNORECASE)`."""
-    tags, pos = [], 0
-    while True:
-        tag = _INPUT_OPEN.search(html, pos)
-        if tag is None:
-            return tags
-        gt = html.find('>', tag.end())
-        if gt < 0:
-            return tags
-        if _TYPE_HIDDEN.search(html, tag.end(), gt):
-            tags.append(html[tag.start():gt + 1])
-        pos = gt + 1
 
 
 def _meta_refresh_contents(html):
@@ -1151,10 +1154,29 @@ class _TagCollector(HTMLParser):
     # altrimenti interpretato come markup.
     _SUPPRESS_RAWTEXT = frozenset({"iframe"})
 
-    def set_cdata_mode(self, elem, *, escapable=False):
+    def set_cdata_mode(self, elem, **kwargs):
+        # SEC-51: fino a CPython 3.12.11 la libreria chiama `set_cdata_mode(elem)` e il metodo base non accetta
+        # `escapable`: passarlo sempre faceva fallire ogni pagina con `<script>` o `<style>`. Si inoltra solo ciò che
+        # la libreria passa.
         if elem.lower() in self._SUPPRESS_RAWTEXT:
             return
-        super().set_cdata_mode(elem, escapable=escapable)
+        super().set_cdata_mode(elem, **kwargs)
+
+    def reset(self):
+        super().reset()
+        # SEC-51: le versioni che hanno `_support_cdata` lo accendono a ogni `reset`, e allora `<![CDATA[` apre una
+        # sezione fino a `]]>` che nasconde i tag al suo interno. Nel contenuto HTML il browser la legge come commento
+        # fino al primo `>`: spenta, la libreria fa lo stesso.
+        if hasattr(self, "_set_support_cdata"):
+            self._set_support_cdata(False)
+
+    def parse_marked_section(self, i, report=1):
+        # SEC-51: fino a CPython 3.12.11 ogni `<![` arriva qui, e `_markupbase` solleva `AssertionError` su una parola
+        # chiave sconosciuta (`<![foo[x]]>`): l'analisi della pagina falliva. Le versioni successive, con
+        # `_support_cdata` spento (sopra), lo leggono come commento fino al primo `>`, come il browser nel contenuto
+        # HTML: qui la stessa grammatica.
+        end = self.rawdata.find(">", i + 3)
+        return -1 if end < 0 else end + 1
 
 
 # SEC-48: tre regex della libreria standard (`locatetagend`, `tagfind_tolerant`, `attrfind_tolerant`) ripetono un
@@ -1531,7 +1553,8 @@ def _collect_dead_markup(collector, self_domain):
 
     # ── Caso (a): fallback content opaco ──
     for t in collector.tags:
-        if not t["_opaque"]:
+        # CLS-01u: il collector raccoglie anche gli `<input>`, che non sono markup morto.
+        if not t["_opaque"] or t["name"] not in _DEAD_MARKUP_TAGS:
             continue
         url = _dead_markup_url(t["name"], t["attrs"])
         host = _dead_markup_external_host(url, _self)
@@ -1714,29 +1737,34 @@ def detect_hidden_elements(html: str, self_domain: str = None) -> dict:
     # Normalizza il dominio del sito stesso (per escludere risorse self-hosted)
     _self = _strip_www(self_domain)
 
-    # ── 1. Hidden input fields ──
-    hidden_inputs = _hidden_input_tags(html)
-    for inp in hidden_inputs:
-        name = re.search(r'name\s*=\s*["\']?([^"\'>\s]+)', inp, re.IGNORECASE)
-        value = re.search(r'value\s*=\s*["\']?([^"\'>\s]*)', inp, re.IGNORECASE)
-        findings["hidden_inputs"].append({
-            "tag": inp[:200],
-            "name": name.group(1) if name else None,
-            "value": (value.group(1)[:100] if value else None)
-        })
-
     # SEC-48: un solo parsing per form, iframe, img e markup morto invece di uno per insieme di tag. I tag non opachi
     # di un nome sono quelli di un parsing dedicato: le regioni opache dipendono solo dagli `<iframe>`, non dai tag
     # richiesti. I tag opachi si scartano a ogni uso, non nel collector: restano nella sua lista finché il parsing non
     # stabilisce se l'iframe che li contiene si chiude. Col parser a costo limitato si assegna il buffer e si chiama
     # solo `close` (la prova all'import ne ha verificato l'uso): `feed` si fermerebbe su un tag che non si chiude e
     # `close` lo leggerebbe di nuovo da capo.
-    dead_markup_collector = _TagCollector(_DEAD_MARKUP_TAGS)
+    # CLS-01u: lo stesso parsing raccoglie anche gli `<input>`.
+    dead_markup_collector = _TagCollector(_DEAD_MARKUP_TAGS + ("input",))
     if _HTML_PARSER_FALLBACK is None:
         dead_markup_collector.rawdata = html
     else:
         dead_markup_collector.feed(html)
     dead_markup_collector.close()
+
+    # ── 1. Hidden input fields ──
+    # CLS-01u: dal tokenizer, come form, iframe e pixel. La scansione testuale chiudeva il tag al primo `>` anche
+    # dentro un valore quotato (l'input dopo spariva), troncava nome e valore al primo spazio o apice, e contava
+    # `type=hidden` anche dentro un altro attributo o in un `type` ripetuto, che il browser ignora.
+    for inp in (t for t in dead_markup_collector.tags if t["name"] == "input" and not t["_opaque"]):
+        attrs = inp["attrs"]
+        if (attrs.get("type") or "").lower() != "hidden":
+            continue
+        value = _cap_ioc(attrs.get("value"))
+        findings["hidden_inputs"].append({
+            "tag": inp["text"][:200],
+            "name": _cap_ioc(attrs.get("name")),
+            "value": value[:100] if value is not None else None,
+        })
 
     # ── 2. Hidden forms (display:none, visibility:hidden, opacity:0) ──
     # CLS-01h: stessa migrazione del punto 3 (CLS-01g) — i vecchi pattern regex
@@ -1755,11 +1783,15 @@ def detect_hidden_elements(html: str, self_domain: str = None) -> dict:
         # non va corretto qui di soppiatto.
         if not is_hidden:
             is_hidden = "hidden" in (attrs.get("class") or "").lower()
+        technique = "css_hidden"
+        # CLS-01p: l'attributo booleano `hidden` nasconde il form con qualunque valore, anche vuoto.
+        if not is_hidden and "hidden" in attrs:
+            is_hidden, technique = True, "hidden_attribute"
         if is_hidden:
             findings["hidden_forms"].append({
                 "snippet": form["text"][:300],
                 "action": _cap_ioc(attrs.get("action")),
-                "technique": "css_hidden"
+                "technique": technique
             })
 
     # ── 3. Invisible iframes ──
@@ -1802,6 +1834,10 @@ def detect_hidden_elements(html: str, self_domain: str = None) -> dict:
         if re.search(r'(left|top)\s*:\s*-\d{3,}', style, re.IGNORECASE):
             is_hidden = True
             technique.append("offscreen")
+        # CLS-01p: attributo booleano `hidden`, come per i form.
+        if "hidden" in attrs:
+            is_hidden = True
+            technique.append("hidden_attribute")
 
         if is_hidden:
             findings["invisible_iframes"].append({

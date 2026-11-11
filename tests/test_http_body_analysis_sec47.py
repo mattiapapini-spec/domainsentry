@@ -1374,22 +1374,22 @@ _READABLE_EXPECTED = {
 
 # Impronta (`_check_signature` sulle sole liste da regex) di ogni documento di `_corpus()`, nello stesso ordine.
 _CORPUS_EXPECTED = (
-    '532c85b9214a7fbd', 'b0f0ae31f7e0eaf4', '730284d96ac766d2', 'b784cee2097cc12b', '5474f65b64185430',
-    '0aeab7976f9f7208', '2a19e39fe2b2c811', '427482a863c72107', 'f54c3f57165adeaa', '41a6bb7aeee64b66',
-    '66dd755368a650b1', 'e6f505cb5eb3f063', '4f270c782e7b6ec6', 'bd2a53d3317d5aec', 'a35d2c0e2ae013b2',
-    'a555b893157111f4', '63355f22b431ab7b', '8e9bfd9620d8e051', '57a5df59dfa957cc', 'f0f4806d4468c71a',
-    '4abb738e2bdfd995', '81113214fff0be40', '6a00dc865f619483', '2aad82cfef1f90fc', '3c694fc5c9ceb783',
-    'c17c54eb5e0a2c86', 'ef351c3dc0b9ded1', '94f61293f48cb34f', '58c96faad4273a50', '0a039289ca60cf0d',
-    '78beef42909a72a2', '1044bb4b8167fc0d', '432da4168dbd342f', '7f3dd4dd527c66ef', 'ee4744ddd332d7db',
-    '9b8df9b8c1db1844', '33dbf0d91bb0cd0f', '7818f03dfd5115ab', '89113121373d655f', '5fd777b4e40e5726',
-    'ad42e984e0505dd9', 'cd3e04486f26583f', 'f86bab9f150b1108', '8ab7ae082904398a', '25faa9963e176d29',
-    'f6342a8edc914f1a', '58ca10afcebdaa43', '775c8475cd67032a', '646ab768812d7aa4', '09b99bfd19d0d819',
-    'c375591e93e172d1', '3ec7143eced36d69', '323a7bb35ee4a80d', '73c370f0abac3b2d', '07766cd9fbcc9d7b',
-    'd0ea0912cb8d5ed2', 'e93b2eaef05e9cae', '9c00a3804a06c611', '68790f6cdf4f842e', '15f2f85bab06ab79',
-    '13222888cfa1820c', 'e6484945b2dede66', 'b047e426f8213709', 'ae2fc93da0b3b0b1', '9135fb2b9ed1b1dd',
-    '0281a1e49a713ad8', 'adf68cc024647c3f', '9d1aad9307ae44eb', '3265cb085c1bd665', '2500dd40ae168ce4',
-    '7fa9cc0ac6c66ad8', 'b94cbcfd2636dcd0', 'e149457f4995ba59', '86f965c982a87233', '63bd64b4d670cb2b',
-    '41b39979782b63b0', '1787af773ffab044', '9b49feb78df79b46', '9ecb1bd801537940', '911f2dcae13e60ec',
+    'd4efdcf7d37ec2ae', 'b7df1f9fa22d20c0', '730284d96ac766d2', 'aeb5e40ef1cba21c', '257199cb5a95163f',
+    '2b4ced4dc22e7d0b', '2a19e39fe2b2c811', '9afbea8d5a6009ae', 'f54c3f57165adeaa', 'df22ffa7bf1c1308',
+    '66dd755368a650b1', 'e6f505cb5eb3f063', '9d9c0173f557f62a', 'bd2a53d3317d5aec', '7f6bbc7ca578912d',
+    'a555b893157111f4', 'b2adf1c4a2da0acc', '8e9bfd9620d8e051', '24852d507f89b1c8', '0b81adce8a258429',
+    '4abb738e2bdfd995', '81113214fff0be40', 'dd5e4abce6c3dcc3', '41c1486eea58d940', '3be8124f066a5935',
+    '35698838cf35c014', 'ef351c3dc0b9ded1', '2807bd635ba898c6', '46052c83922fa9d0', '0a039289ca60cf0d',
+    'acd4917a9878635e', '1044bb4b8167fc0d', '432da4168dbd342f', '7f3dd4dd527c66ef', 'ee4744ddd332d7db',
+    '9b8df9b8c1db1844', '33dbf0d91bb0cd0f', '7818f03dfd5115ab', '42488196aa791213', '5fd777b4e40e5726',
+    '4e14b538e9808b25', 'f7decc3745a73edc', 'b621f1ff822883c4', '8ab7ae082904398a', '25faa9963e176d29',
+    'f6342a8edc914f1a', 'a524df47042747cc', '1b41453c7b7a5daa', '1265ba2684654c0d', '5eaf5e351cf23050',
+    '07bdbf9db6c20678', '3ec7143eced36d69', '9ce5bdef54ce2413', '6e4c7d965b7befd7', 'b8a752afa7f18100',
+    '4394ec47ea0bae5e', '0540c13b80941cc1', '9c00a3804a06c611', '5a7accbb1ef63905', 'd3b154a0d2d3112e',
+    '13222888cfa1820c', 'd764b4085fbcb696', 'f36dbff98dd947cb', 'a8b476fa219c141f', '9135fb2b9ed1b1dd',
+    '0281a1e49a713ad8', 'adf68cc024647c3f', '9d1aad9307ae44eb', '3265cb085c1bd665', '2b8887fb46bbcfbf',
+    'd7d70f547eab7b83', 'b94cbcfd2636dcd0', 'dfd3ec5548648476', '86f965c982a87233', '63bd64b4d670cb2b',
+    'f9422b570d402fd0', '8598b7ca8104f9ad', '9c3a27278dbb0d86', '9ecb1bd801537940', 'fd39a8be0d2649f4',
 )
 
 
@@ -1409,10 +1409,10 @@ def _check_signature(check, keys=None):
 
 
 # Le liste degli elementi nascosti ricavate da regex. Quelle ricavate dal parser HTML della libreria standard
-# (form, iframe, pixel, markup morto, quindi anche rischio e `summary`) restano fuori dal corpus casuale: sul
-# markup malformato il parser cambia fra una versione di Python e l'altra.
-_REGEX_LISTS = ("hidden_inputs", "meta_redirects", "obfuscated_js", "hidden_divs_with_content", "large_comments",
-                "base64_content", "external_resources")
+# (form, iframe, pixel, markup morto, input nascosti da CLS-01u, quindi anche rischio e `summary`) restano fuori
+# dal corpus casuale: sul markup malformato il parser cambia fra una versione di Python e l'altra.
+_REGEX_LISTS = ("meta_redirects", "obfuscated_js", "hidden_divs_with_content", "large_comments", "base64_content",
+                "external_resources")
 
 _FRAGMENTS = [
     "<script>", "</script>", "<SCRIPT type=text/javascript>", "</script >", "<style>", "</style>", "<!--", "-->",
