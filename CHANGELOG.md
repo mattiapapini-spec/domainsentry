@@ -38,6 +38,97 @@ All notable changes to this project will be documented in this file.
   Python Software Foundation License.
 
 ### Fixed
+- **The version constraint on urllib3 allowed versions on which the decompression-bomb cap of
+  `SEC-16` does not hold (`SEC-22`).** `requirements.txt` asked for `urllib3>=2,<3`, and the image
+  installs from it at build time. Measured with `TestFetchDecompressionBombGuardrail` (requests
+  2.32.3, Python 3.12): from 2.0.0 to 2.6.1 the chunked + gzip case decompressed a single chunk of
+  about 20 MB against a threshold of 32 KB; from 2.6.2 (2.6.2, 2.6.3, 2.7.0, 2.8.0) both cases pass.
+  **What changes.** The constraint is `urllib3>=2.6.2,<3`; the requirements still resolve to the same
+  versions today (urllib3 2.8.0). A new test checks the constraint against the measured versions and
+  the installed urllib3 against the constraint, using `packaging`, already installed with pytest. An
+  image built before this change may carry an older urllib3: check it with
+  `python3 -c "import urllib3; print(urllib3.__version__)"` in the container. 11 regression tests in
+  `tests/test_urllib3_constraint_sec22.py`.
+- **`collection_status` of `/classify/variant`, in the unauthenticated zone, was a free dictionary
+  (`CODE-31`).** Any key of any length was accepted and ended in the rationale of the collection
+  guard (`CODE-30` capped it downstream), and any truthy value, the string `"false"` included,
+  declared a section failed. **What changes.** Only `dns`, `cert`, `http`, `whois` and `reputation`
+  are accepted, each with a boolean; anything else is rejected with 422, also inside
+  `/classify/batch`. The orchestrator sends only those keys with booleans, so nothing changes for it.
+  The two `CODE-30` tests that classified with a 2,000-character key now check that the key is
+  rejected; the cap on the template stays as defence in depth. 18 regression tests in
+  `tests/test_collection_status_validated_code31.py`.
+- **The orchestrator put the domain into the URLs of the internal services without encoding it
+  (`SEC-14`).** `/dns`, `/cert`, `/http`, `/whois`, `/reputation`, the dnstwist call and the WHOIS-only
+  lookup of a dormant homoglyph were built as `?domain={domain}&…`: a `&`, `#` or `?` in the name
+  could change the other parameters of the internal call, and only the domain pattern of each service
+  stood in the way. **What changes.** The domain is percent-encoded in all seven URLs, so the service
+  receives exactly the name and the orchestrator's own parameters stay as they are; a malformed name
+  is now rejected by the service as a whole. For an ordinary domain the URLs are identical to before.
+  4 regression tests in `tests/test_internal_urls_encoded_sec14.py`.
+- **A `/diff` that answered with an HTTP error left no line in the log (`CODE-43`).** `_persist_intel`
+  logged only the exceptions of the call: with a 500 the comparison with the previous cycle was lost
+  without a trace. **What changes.** An error answer (4xx or 5xx) logs a warning with the domain and the status.
+  The snapshot is still overwritten in that case, as before: keeping the change for the next cycle is
+  part of `COL-29`. 5 regression tests in `tests/test_persist_intel_diff_log_code43.py`.
+- **With `INTEL_STORE=false` the pipeline still wrote snapshots and history for dnstwist variants
+  (`OPS-06`).** The loop over the feed domains checked the flag; the `variant_intel` branch called
+  `_persist_intel` for every resolving variant anyway, which saved the snapshot under `INTEL_DIR` and,
+  with an earlier snapshot, called `/diff` and appended the history. **What changes.** The variant
+  branch checks the same flag: with the store off nothing is written and no `/diff` is called, while
+  the variant is still collected and classified with its intel. With the store off, the homoglyph
+  WHOIS reused by `SCO-05` after a restart can only come from the in-process cache, as the flag
+  implies. 4 regression tests in `tests/test_variant_intel_store_flag_ops06.py`.
+- **A variant found by dnstwist kept the fixed `needs_review` label whenever its intel was not
+  collected, and the classifier was never asked (`CODE-17`).** Without `variant_intel`, and with it
+  for a variant that does not resolve and is not a homoglyph, the event carried the discovery
+  placeholder (`dnstwist_discovery`, confidence `low`): the rules on the name alone, such as the
+  script mixing of a homoglyph, never applied to these variants. **What changes.** Such a variant is
+  sent to `/classify/variant` with its name and fuzzer, an empty `collection_status` and, for a
+  homoglyph, the WHOIS already observed in an earlier cycle (`SCO-05`, no network call): no module is
+  declared, so nothing that was not collected is read as absent. A homoglyph with mixed scripts and no
+  known WHOIS now becomes `suspicious` (HIGH case severity) also without `variant_intel`, while one
+  whose known WHOIS predates the campaign stays LOW; a variant that no rule matches stays
+  `needs_review`, with the classifier's rule instead of the placeholder. The call has the 10 s
+  timeout of the classification of the feed domains, one call per variant. If the classifier fails
+  or does not answer, the placeholder stays and the event is still published. On the first cycle
+  after the update, homoglyph variants of a client may move from MEDIUM to HIGH. 8 regression tests in
+  `tests/test_variant_discovery_classified_code17.py`.
+- **A certificate name that was not a string made `/classify/variant` fail with a 500, and the domain
+  stayed without a classification for that cycle (`CODE-18`).** crt.sh can return
+  `"common_name": null`: when that is the only certificate name of a domain, `cert_intel` passes
+  `[None]` in `unique_cn`, and `/classify/variant`, in the unauthenticated zone, takes the payload as
+  it comes. The classifier compared every element with the enterprise certificate providers, and a
+  `None` (or a number) raised `TypeError`.
+  **What changes.** The classifier reads only the elements of `unique_cn` that are strings, and a
+  `unique_cn` that is not a list counts as empty: a null next to an enterprise provider still finds
+  it, and a list of nulls classifies like an empty list. 11 regression tests in
+  `tests/test_classifier_cert_names_code18.py`.
+- **A form or an iframe hidden with the HTML5 `hidden` attribute was not detected (`CLS-01p`).**
+  `hidden_forms` looked only at `style` and at `class`, `invisible_iframes` only at the size and at
+  `style`: `<form hidden action=…>` raised nothing, while the browser does not show the element.
+  **What changes.** A form with the attribute, whatever its value, is hidden, with `technique`
+  `hidden_attribute` (`css_hidden` stays when the style or the class already hide it, so the output of
+  those forms does not change); an iframe with the attribute is invisible and `hidden_attribute` joins
+  its other techniques. Forms and iframes in the fallback content of a closed `<iframe>` stay out, as
+  before. On the first cycle after the update, a monitored legitimate domain that already hides a form
+  or an iframe this way raises the matching alert once. 22 regression tests in
+  `tests/test_hidden_attribute_cls01p.py`.
+- **Hidden inputs were still read with a text scan after forms, iframes and pixels had moved to the
+  tokenizer, so a page could hide them or report them wrong (`CLS-01u`).** Valid markup could keep a
+  hidden input out of the scan, names and values were cut short, and inputs that the browser does not
+  treat as hidden were counted. **What changes.** `detect_hidden_elements` reads `<input>`
+  from the same single parse as forms, iframes and pixels (`SEC-48`, no second pass on the page): an
+  input is hidden when its first `type` is `hidden` in any case; `name` and `value` are the whole
+  values as the browser submits them (entities decoded), without control characters, the name capped
+  at 300 characters and the value at 100 as before. As for the other tokenizer categories, inputs in
+  HTML comments, in the fallback content of a closed `<iframe>` and inside `<script>`/`<style>` are not
+  live markup and are no longer counted. The inputs collected by the parse never count as dead markup
+  (`CLS-01z` still reads only iframes, forms and images). The random corpus of
+  `test_http_body_analysis_sec47.py` checks only the lists read by regex, so `hidden_inputs` leaves it
+  (45 of its 80 expected signatures recomputed): on those 80 documents and on the 9 readable pages
+  every other list is identical before and after. 15 regression tests in
+  `tests/test_hidden_inputs_cls01u.py`.
 - **A request to `/reputation` could take up to about 105 s, while the orchestrator gives up after
   45 s; the abandoned request still spent a VirusTotal quota slot and the OTX and SecurityTrails
   calls on a result that was lost, and the domain lost its reputation section and became

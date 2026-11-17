@@ -1,19 +1,25 @@
 fastapi==0.115.12
 uvicorn[standard]==0.34.2
 requests==2.32.3
-# urllib3>=2 required: il cap sul body (SEC-16) dipende dal max_length bound di
-# iter_content introdotto in urllib3 2.x; una versione <2 riaprirebbe la
-# decompression bomb (vedi TestFetchDecompressionBombGuardrail). Sottoinsieme
-# valido del range già richiesto da requests==2.32.3 (>=1.21.1,<3).
+# urllib3>=2.6.2 required: il cap sul body (SEC-16) dipende dal max_length bound di
+# iter_content di urllib3; prima della 2.6.2 non regge col trasferimento chunked
+# (SEC-22, sotto) e una versione <2 riaprirebbe la decompression bomb anche senza
+# (vedi TestFetchDecompressionBombGuardrail). Sottoinsieme valido del range già
+# richiesto da requests==2.32.3 (>=1.21.1,<3).
 # Questo pin è la protezione PRIMARIA contro la decompression bomb, non un
 # aiuto opzionale: TestFetchDecompressionBombGuardrail verifica il
-# comportamento per-chunk ma gira sempre nell'ambiente pinnato (urllib3>=2),
+# comportamento per-chunk ma gira sempre nell'ambiente pinnato,
 # quindi in CI non intercetterebbe una regressione causata dall'allentamento
 # di questo vincolo. Prima di allentarlo o rimuoverlo serve introdurre una
 # difesa esplicita nel codice (decompressione bounded, es.
 # zlib.decompressobj con max_length in http_get_with_retry): altrimenti il
 # DoS da decompression bomb si riapre silenziosamente.
-urllib3>=2,<3
+# SEC-22: non basta la serie 2.x. Misurato con TestFetchDecompressionBombGuardrail
+# (requests 2.32.3, Python 3.12): da 2.0.0 a 2.6.1 il caso chunked + gzip
+# decomprime un blocco di circa 20 MB; da 2.6.2 (2.6.2, 2.6.3, 2.7.0, 2.8.0)
+# il picco resta entro la soglia. tests/test_urllib3_constraint_sec22.py
+# controlla questo vincolo e la versione installata.
+urllib3>=2.6.2,<3
 python-whois==0.9.5
 dnstwist[full]==20250130
 

@@ -645,37 +645,34 @@ class TestCollectionGuardPreservesRuleRationale:
     # propagato dall'orchestrator ma non validato qui. Una chiave enorme (o
     # arbitraria) fa esplodere il template PRIMA che il budget calcolato a
     # valle abbia una qualunque possibilità di intervenire.
+    #
+    # CODE-31 (modifica giustificata, G5): da CODE-31 `collection_status`
+    # accetta solo le cinque sezioni con un booleano, quindi una chiave
+    # enorme non arriva più al template: è rifiutata dalla validazione del
+    # modello (422 sull'endpoint, `tests/test_collection_status_validated_code31.py`).
+    # I due test sotto asserivano la classificazione ottenuta con quella chiave;
+    # ora asseriscono che la chiave non passa. Il tetto del template resta nel
+    # codice come difesa in profondità.
 
-    def test_rationale_cap_holds_with_huge_collection_status_key_no_rule(self):
-        """Variante 1: chiave enorme in `collection_status`, nessuna regola
-        scattata (`no_matching_rule`). Sul percorso `no_matching_rule` oggi
-        non viene appesa alcuna coda (`underlying_rule == "no_matching_rule"`,
-        classifier.py:382) — quindi il tetto non ha NESSUN punto in cui
-        intervenire: il template stesso, gia' gonfio della chiave enorme, e'
-        l'intera rationale restituita."""
+    def test_huge_collection_status_key_never_reaches_the_template_no_rule(self):
+        """Variante 1: chiave enorme in `collection_status`, scenario senza
+        regola (`no_matching_rule`), dove il template sarebbe l'intera
+        rationale: la chiave è rifiutata prima della classificazione."""
+        from pydantic import ValidationError
         huge_key = "cert" + "X" * 2000
-        r = self._classify("huge-collection-key-norule.example", cert=self.CERT_FAILED,
-                            collection_status={huge_key: True})
-        assert r["auto_classification"] == "insufficient_data", r
-        assert r["rule"] == "module_collection_failed", r
-        assert len(r["rationale"]) <= self._RATIONALE_CAP, len(r["rationale"])
+        with pytest.raises(ValidationError):
+            self._classify("huge-collection-key-norule.example", cert=self.CERT_FAILED,
+                           collection_status={huge_key: True})
 
-    def test_rationale_cap_holds_with_huge_collection_status_key_and_rule(self):
-        """Variante 2: stessa chiave enorme, ma una regola assolutoria/
-        needs_review E' scattata prima che la guardia intervenga
-        (`known_parking_ns`, stesso scenario DNS del test sopra). Il budget
-        calcolato a valle (classifier.py:385) sottrae la lunghezza del
-        template gia' costruito, quindi con un template abbastanza grande
-        `max(0, ...)` collassa a zero — ma il template stesso, che precede
-        quel calcolo, resta fuori tetto: il "perche'" della regola puo'
-        anche sparire (budget zero), il tetto sul totale non puo' esserlo."""
+    def test_huge_collection_status_key_never_reaches_the_template_with_rule(self):
+        """Variante 2: stessa chiave enorme con una regola scattata prima
+        della guardia (`known_parking_ns`): rifiutata allo stesso modo."""
+        from pydantic import ValidationError
         huge_key = "cert" + "Y" * 2000
-        r = self._classify("huge-collection-key-rule.example", cert=self.CERT_FAILED,
-                            dns={"records": {"A": ["1.2.3.4"], "MX": [], "NS": ["ns47.domaincontrol.com"]}},
-                            collection_status={huge_key: True})
-        assert r["auto_classification"] == "insufficient_data", r
-        assert r["rule"] == "module_collection_failed", r
-        assert len(r["rationale"]) <= self._RATIONALE_CAP, len(r["rationale"])
+        with pytest.raises(ValidationError):
+            self._classify("huge-collection-key-rule.example", cert=self.CERT_FAILED,
+                           dns={"records": {"A": ["1.2.3.4"], "MX": [], "NS": ["ns47.domaincontrol.com"]}},
+                           collection_status={huge_key: True})
 
     # ── Non-regressione (verde oggi): le altre quattro chiavi dell'esito
     # della guardia restano identiche, qualunque sia la regola sottostante ──
