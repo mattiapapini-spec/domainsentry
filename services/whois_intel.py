@@ -68,6 +68,17 @@ CACHE_MAX_SIZE = int(os.environ.get("CACHE_MAX_SIZE", "500"))
 _last_query_time = 0.0
 _rate_lock = threading.Lock()
 
+# PERF-02: il turno fra due query si prenota sotto `_rate_lock` e si aspetta fuori. Prima si dormiva tenendo il
+# lucchetto: le richieste concorrenti si mettevano in fila, ognuna con un thread del pool condiviso del processo
+# unificato, e la k-esima aspettava circa k × WHOIS_DELAY senza limite. Chi dovrebbe aspettare più di
+# WHOIS_MAX_WAIT_S risponde subito con questo errore fisso: il modulo non è raccolto e il ciclo precedente viene
+# riportato, come VirusTotal senza posto nella quota (PERF-05). Caso peggiore: 12 s di turno, 15 s di lookup
+# (WHOIS_LOOKUP_DEADLINE_S), 8 s di attesa di un posto per il figlio e 8 s del figlio (WHOIS_PARSE_TIMEOUT_S): 43 s,
+# sotto i 45 s dell'orchestrator. Turno e ultima query sull'orologio monotono: un salto all'indietro dell'orologio
+# di sistema bloccherebbe le query per tutta la durata del salto. Costante di modulo, come le soglie di SEC-35.
+WHOIS_MAX_WAIT_S = 12
+WHOIS_RATE_BUSY_ERROR = "WHOIS lookup skipped: no query slot within the wait limit"
+
 try:
     import whois as whois_lib
     HAS_WHOIS_LIB = True
@@ -103,10 +114,18 @@ def whois_check(domain: str = Query(..., min_length=4, max_length=253, pattern=r
     # Rate limiting: only wait the remaining time since last real query
     global _last_query_time
     with _rate_lock:
-        elapsed = time.time() - _last_query_time
-        if elapsed < WHOIS_DELAY:
-            time.sleep(WHOIS_DELAY - elapsed)
-        _last_query_time = time.time()
+        now = time.monotonic()
+        turn = max(now, _last_query_time + WHOIS_DELAY)
+        wait = turn - now
+        if wait <= WHOIS_MAX_WAIT_S:
+            _last_query_time = turn
+    if wait > WHOIS_MAX_WAIT_S:
+        # Come WHOIS_PARSE_BUSY_ERROR: dipende dal carico del momento, non dal dominio, quindi niente cache.
+        logger.warning(f"WHOIS: nessun turno entro {WHOIS_MAX_WAIT_S}s per {sanitize_log_input(domain)}")
+        result["error"] = WHOIS_RATE_BUSY_ERROR
+        return JSONResponse(content=result)
+    if wait > 0:
+        time.sleep(wait)
 
     try:
         if HAS_WHOIS_LIB:

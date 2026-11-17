@@ -38,6 +38,68 @@ All notable changes to this project will be documented in this file.
   Python Software Foundation License.
 
 ### Fixed
+- **The orchestrator lost results without saying so when classification, diff, event publishing or
+  discovery failed (`COL-29`).** A domain whose classification failed disappeared from the events of
+  the cycle; a failed `/diff` (or a history that could not be written) let the snapshot be
+  overwritten, and the change of that cycle never came out; "Pubblicati N eventi" was logged also
+  when `/publish` answered with an error; a dnstwist HTTP error left no trace; and the run ended
+  `done` with nothing to show. **What changes.** A domain whose classifier did not answer still
+  reaches the events, with the fallback classification `needs_review` and rule
+  `classification_unavailable`; that event is not ingested as a case, since it would overwrite the
+  classification of open cases. After a failed diff the snapshot is still updated (invalid data must
+  not stop it, `COL-16`, and a diff that fails on the same data would fail at every cycle), but it
+  keeps the baseline of the last successful diff (`diff_baseline`, not shown by `/intel`): the next
+  diff starts from there and the change comes out then; a diff without changes is not a failure.
+  `/publish` now lists in `failed` every enabled target that did not write (it answered 200 with an
+  empty `targets` before, the same as a disabled target), and the orchestrator does not log
+  "Pubblicati N eventi" when the answer is an error or a target failed. A domain without a
+  classification is written to the file for the SIEM but not sent to the chat webhook: with the
+  classifier down it would be one message per domain. On the dnstwist variants, a classification that
+  fails is logged and counted (the event keeps the discovery placeholder), and an error while saving
+  the snapshot no longer skips the classification of the variant. Failed discovery is logged, the log
+  of the classifier and dnstwist errors is sanitized, and every failure of the run is counted in
+  `/progress` under `failures` (`classification`, `diff`, `store`, `publish`, `discovery`). 23
+  regression tests in `tests/test_pipeline_failures_col29.py`.
+- **With the capacity filter alone, an anonymous flood on the collectors also took the places the
+  legitimate scan needs (`PERF-08`, with the accounting of abandoned scan requests).** **What
+  changes.** 8 places are reserved to the requests of the orchestrator, recognised by the
+  `X-DomainSentry-Scan` header with a random mark generated at every start of the process and never
+  exposed (compared in constant time); with the reserve full the scan uses the anonymous places. A
+  scan request older than the `SERVICE_TIMEOUT` of the orchestrator has already been abandoned, since
+  the orchestrator always gives up at that threshold, but its thread is still busy: it moves to a
+  separate count of at most 4 places, with a line in the log, and the reserve goes back to the live
+  scan. At most 20 + 8 + 4 = 32 collector requests run at once, of the 40 threads. The orchestrator
+  sends the mark from its HTTP session, so in the unified deployment every orchestrator call carries it;
+  all those URLs point to the same process there. 11 regression tests in
+  `tests/test_unified_capacity_perf08.py`.
+- **In the unified process, slow requests to the collectors could take every thread and make the rest
+  of the service unreachable, health probe included (`PERF-04`, capacity filter).** The synchronous
+  handlers of every service share the 40 threads of the anyio pool. Measured on the code before this
+  change: with 45 concurrent `/whois` requests of 1.5 s each, `/health` answered after 1.06 s instead
+  of at once. **What changes.** An ASGI filter in `unified.py`, before the thread pool, admits at most
+  20 requests to `/dns`, `/cert`, `/http`, `/whois` and `/reputation` together, 8 per collector and
+  4 for reputation; for WHOIS the places follow its turn queue (`PERF-02`): every admitted request
+  books a turn `WHOIS_DELAY` apart, so the places leave two turns of margin within
+  `WHOIS_MAX_WAIT_S`, 4 with the default settings, otherwise even a request of the scan would find no
+  turn. The others get a 503 with `Retry-After: 5` at once, without taking a thread, and the refusals
+  are logged at most once every 10 s with their counts. The path is read without the `root_path`, as
+  Starlette routes it, so a deployment behind a prefix does not switch the filter off. A place comes back when the
+  handler really ends, not when the caller stops waiting, since its thread is busy until then. The
+  other paths do not go through the filter. In this change the scan of the orchestrator counts like
+  any other caller: its reserve is `PERF-08`. The split deployment (`docker-compose.prod.yml`) is
+  not affected. 31 regression tests in `tests/test_unified_capacity_perf04.py`.
+- **The WHOIS service waited for its turn while holding the rate lock, so concurrent requests queued
+  without limit (`PERF-02`, WHOIS part).** `whois_check` slept until `WHOIS_DELAY` had passed since the
+  last query with `_rate_lock` held: concurrent requests lined up one behind the other, each holding a
+  thread of the pool that the unified process shares with the dashboard and the login, and the k-th
+  waited about k × `WHOIS_DELAY` with no bound. **What changes.** The turn is booked under the lock and
+  waited for outside it, on the monotonic clock (a step back of the system clock would otherwise block
+  the queries for as long as the step); the minimum spacing between two queries stays `WHOIS_DELAY`. A
+  request that would wait more than `WHOIS_MAX_WAIT_S` (12 s) answers at once with a fixed error, not
+  cached: the module is not collected and the previous cycle is carried over, as for VirusTotal
+  without a quota slot (`PERF-05`). Worst case of a request: 12 s of turn, 15 s of lookup and 8 + 8 s
+  for the parsing child, 43 s against the 45 s of the orchestrator. The reputation side was already
+  bounded by `PERF-05`. 6 regression tests in `tests/test_whois_rate_wait_perf02.py`.
 - **No limit on the `dig` processes of the whole service (`PERF-04`, process cap only).** After
   `SEC-29` one `/dns` request starts up to 10 `dig` at once, 7 already with `full=false`, and
   concurrent requests multiplied them with no ceiling. **What changes.** At most `DIG_MAX_PROCESSES`

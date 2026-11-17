@@ -39,7 +39,9 @@ class PublishRequest(BaseModel):
 def publish(req: PublishRequest):
     """Pubblica eventi verso tutti i target configurati."""
     logger.info(f"Pubblicazione {len(req.events)} eventi")
-    results = {"published": len(req.events), "targets": []}
+    # COL-29: un target abilitato che non scrive finisce in `failed`: prima la risposta era 200 con `targets` vuoto e
+    # chi pubblicava non poteva distinguerla da un target disabilitato.
+    results = {"published": len(req.events), "targets": [], "failed": []}
 
     # File NDJSON
     if FILE_ENABLED:
@@ -54,6 +56,7 @@ def publish(req: PublishRequest):
             logger.info(f"  File: {len(req.events)} righe → {ndjson_path}")
         except Exception as e:
             logger.error(f"  File error: {e}")
+            results["failed"].append("file")
 
     # Latest snapshot
     try:
@@ -69,6 +72,10 @@ def publish(req: PublishRequest):
         try:
             import requests as req_lib
             for event in req.events:
+                # COL-29: un dominio senza classificazione per un guasto del classificatore resta nel file (SIEM) ma
+                # non diventa un messaggio: con il classificatore giù sarebbe un messaggio per ogni dominio.
+                if (event.get("classification") or {}).get("rule") == "classification_unavailable":
+                    continue
                 domain = event.get("domain", "?")
                 client = event.get("client", "?")
                 classification = event.get("classification", {})
@@ -86,6 +93,7 @@ def publish(req: PublishRequest):
             logger.info(f"  Webhook: {len(req.events)} eventi inviati")
         except Exception as e:
             logger.error(f"  Webhook error: {e}")
+            results["failed"].append("webhook")
 
     return JSONResponse(content=results)
 
