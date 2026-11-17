@@ -105,21 +105,33 @@ def cert_check(
                 # un secondo controllo post-download sulla stessa soglia era dead
                 # code irraggiungibile.
                 content = resp["content"]
-                certs = json.loads(content) if content else []
+                # COL-32: un intero oltre il limite di cifre di Python farebbe sollevare
+                # json.loads su tutta la risposta; inf lo rende una riga da scartare.
+                certs = json.loads(
+                    content, parse_int=lambda t: int(t) if len(t) <= 4000 else float("inf")
+                ) if content else []
+                # COL-32: un top-level non lista è un guasto, non un'assenza — va in
+                # errore (e quindi fuori cache) invece di diventare un successo vuoto
+                # una volta saltate le righe non dict.
+                if not isinstance(certs, list):
+                    raise ValueError("crt.sh: risposta JSON non è una lista")
                 unique_cn = set()
                 san_subs = set()
                 cert_list = []
+                discarded = 0
 
                 for cert in certs:
+                    # COL-32: una riga anomala non deve far perdere l'intera raccolta CT.
+                    if not isinstance(cert, dict):
+                        discarded += 1
+                        continue
                     cn = cert.get("common_name", "")
-                    unique_cn.add(cn)
+                    if not isinstance(cn, str):
+                        cn = ""
                     name_value = cert.get("name_value", "")
-                    for name in name_value.split("\n"):
-                        name = name.strip().lstrip("*.")
-                        if name and name != domain and name.endswith(f".{domain}"):
-                            san_subs.add(name)
-
-                    cert_list.append({
+                    if not isinstance(name_value, str):
+                        name_value = ""
+                    record = {
                         "id": cert.get("id"),
                         "common_name": cn,
                         "name_value": name_value,
@@ -127,7 +139,26 @@ def cert_check(
                         "not_before": cert.get("not_before", ""),
                         "not_after": cert.get("not_after", ""),
                         "entry_timestamp": cert.get("entry_timestamp", ""),
-                    })
+                    }
+                    # COL-32: stessi parametri di serializzazione di Starlette; una riga che
+                    # non regge (NaN/Infinity, surrogati) va scartata intera, senza CN né SAN,
+                    # così il risultato — e la cache — restano serializzabili per costruzione.
+                    try:
+                        json.dumps(record, ensure_ascii=False, allow_nan=False).encode("utf-8")
+                    except ValueError:
+                        discarded += 1
+                        continue
+                    if isinstance(cert.get("common_name", ""), str):
+                        unique_cn.add(cn)
+                    for name in name_value.split("\n"):
+                        name = name.strip().lstrip("*.")
+                        if name and name != domain and name.endswith(f".{domain}"):
+                            san_subs.add(name)
+
+                    cert_list.append(record)
+
+                if discarded:
+                    logger.warning(f"crt.sh: {discarded} righe scartate perché anomale")
 
                 result["ct_certificates"] = {
                     "total": len(cert_list),

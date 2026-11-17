@@ -38,6 +38,27 @@ All notable changes to this project will be documented in this file.
   Python Software Foundation License.
 
 ### Fixed
+- **One malformed row in the crt.sh JSON lost the whole Certificate Transparency collection of the
+  domain (`COL-32`, provisional ID).** `cert_check` processed the rows with no per-row guard, so a
+  single row that was not an object, a `common_name` or `name_value` that was not a string (`null`
+  included), `NaN`, `Infinity` or `1e999` in any field, a lone surrogate, or an integer beyond
+  Python's digit limit made the whole parse fail. Depending on the shape the outcome was `error`
+  with `total` 0 and no SAN subdomains, or a 500 raised by the response serialization, which
+  runs outside the `try`. Valid rows in the same answer were lost too. Downstream the cert section
+  counted as failed, the previous data was carried over and `_apply_collection_guard` moved the
+  domain to `insufficient_data`. **What changes.** Each row is now tried with the serialization
+  parameters of Starlette; an anomalous row is discarded whole, with no CN and no SAN, and counted
+  in one `WARNING` of the `cert-intel` logger ("N righe scartate"). An integer of more than 4000
+  digits becomes a discarded row instead of a parse error. The valid rows of the same answer
+  produce the same output as before, and the result, and so the cache, is serializable by
+  construction. A top-level JSON that is not a list is still an error and is not cached, since a
+  failure is not an absence. Checked on `tests/test_cert_intel_rows_col32.py`, 66 cases: 26 of the
+  first 31 failed on the original code, and 27 of 66 on a first version of the fix that did not
+  cover `NaN`, surrogates and huge integers. Known limits: a discarded row also loses the valid
+  SANs of its `name_value`; JSON nested about 100,000 levels deep still fails `json.loads`, as an
+  explicit error that is not cached; `issuer_name` and the dates are not validated as strings.
+  Checked with in-memory doubles, not on a real crt.sh answer: crt.sh was not reachable from the
+  session.
 - **The orchestrator lost results without saying so when classification, diff, event publishing or
   discovery failed (`COL-29`).** A domain whose classification failed disappeared from the events of
   the cycle; a failed `/diff` (or a history that could not be written) let the snapshot be
