@@ -370,6 +370,19 @@ def _classify_by_rules(v: VariantInput):
 
     # ── Regole di classificazione (ordine di priorità) ──
 
+    # CODE-68: una pagina che fa fallire l'analisi del corpo è una scelta di chi la serve. In testa alla cascata:
+    # sotto, il controllo fallito resterebbe un sito attivo e varrebbe parking (poco contenuto) o legittimo (molto).
+    # Come per i tag nascosti, su un dominio vecchio chiede una verifica invece di alzare la severità.
+    if any(c.get("analysis_failed") is True for c in http_checks):
+        if is_aged:
+            return _result(v.domain, "needs_review", "medium",
+                           "body_analysis_failed_aged_domain",
+                           _aged_note("Analisi della pagina servita fallita"))
+        return _result(v.domain, "suspicious", "high",
+                       "body_analysis_failed",
+                       "La pagina servita fa fallire l'analisi del contenuto: nessun tag nascosto osservabile, "
+                       "e il fallimento dipende dal markup scelto da chi la serve. Verifica manuale")
+
     # PARKING
     if any_http_active and max_content_len <= 200:
         return _result(v.domain, "parking", "high",
@@ -947,6 +960,23 @@ def _diff_hidden_elements(curr_http: dict, prev_http: dict, is_legit: bool, aler
     qualsiasi hidden element è CRITICAL (indica compromissione).
     """
     for check in curr_http.get("checks", []):
+        # CODE-68: una pagina che fa fallire l'analisi non ha `hidden_elements` da confrontare. Sul dominio legittimo
+        # del cliente è proprio la pagina che sfugge alla rilevazione: alert a ogni ciclo finché dura, perché dopo il
+        # primo non resterebbe nessun altro segnale su quell'URL. Altrove al primo ciclo, come i tag nascosti nuovi.
+        if isinstance(check, dict) and check.get("analysis_failed") is True:
+            url = check.get("url", "?")
+            prev_failed = any(isinstance(p, dict) and p.get("url") == url and p.get("analysis_failed") is True
+                              for p in prev_http.get("checks", []))
+            if is_legit or not prev_failed:
+                if is_legit:
+                    alerts.append(_alert("legit_body_analysis_failed",
+                        f"⚠ Pagina non analizzabile su {url} (dominio LEGITTIMO del cliente): il contenuto fa "
+                        f"fallire l'analisi, i tag nascosti non sono verificabili. Verifica manuale.",
+                        {"url": url}))
+                else:
+                    alerts.append(_alert("body_analysis_failed",
+                        f"Pagina non analizzabile su {url}: il contenuto fa fallire l'analisi.", {"url": url}))
+            continue
         he = check.get("hidden_elements", {})
         if not isinstance(he, dict):
             continue

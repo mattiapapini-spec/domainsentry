@@ -76,6 +76,10 @@ SEVERITY_MAP = {
     # iframe chiuso) verso host esterno sul dominio LEGITTIMO del cliente —
     # simmetrico ai fratelli legit_* sopra.
     "legit_suspicious_dead_markup_detected": "CRITICAL",
+    # CODE-68: una pagina che fa fallire l'analisi non è un'iniezione osservata, è una pagina che non si è potuta
+    # guardare: come `legit_http_content_changed` sul dominio del cliente, `hidden_elements_high_risk` altrove.
+    "legit_body_analysis_failed": "HIGH",
+    "body_analysis_failed": "HIGH",
 }
 
 # Ordinamento della scala. Unica definizione: prima era ridichiarata in quattro

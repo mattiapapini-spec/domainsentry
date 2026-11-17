@@ -38,6 +38,56 @@ All notable changes to this project will be documented in this file.
   Python Software Foundation License.
 
 ### Fixed
+- **No limit on the `dig` processes of the whole service (`PERF-04`, process cap only).** After
+  `SEC-29` one `/dns` request starts up to 10 `dig` at once, 7 already with `full=false`, and
+  concurrent requests multiplied them with no ceiling. **What changes.** At most `DIG_MAX_PROCESSES`
+  (20, two complete requests) run in the whole process. A query that finds no place within the time
+  it has left is `unknown`, like every query without an answer, never "no record"; the wait for a
+  place is taken from the time of the process, so the deadline of `SEC-29` stays that of the request,
+  and with a free place the process ceiling is the same as before. The capacity filter of `PERF-04`
+  (with `PERF-02` and `PERF-08`) is not part of this change. 5 regression tests in
+  `tests/test_dig_process_cap_perf04.py`.
+- **An error answer from an intelligence service became "no data" without a line in the log
+  (`CODE-71`).** `_fetch_service` returned `None` for any answer that was not ok, and only exceptions
+  were logged: a 500 from `/http` could not be told from a service with nothing to say. **What
+  changes.** An error answer is still no data for that module, and now logs a warning with the
+  service, the HTTP status and the URL. 6 regression tests in
+  `tests/test_service_error_logged_code71.py`.
+- **A body analysis that failed lowered the risk of the domain instead of being a signal
+  (`CODE-68`).** An exception while downloading or analysing one page left `/http` with an error:
+  the four checks were lost, the `http` section reached the classifier empty, and neither the active
+  site nor its hidden elements counted any more (a young domain went from HIGH to MEDIUM). Whoever
+  serves the page chooses its markup, so the failure is theirs to cause. **What changes.** A failure
+  stays on its URL: a download that raises is an unreached URL (`error: "fetch failed"`), an analysis
+  that raises gives `analysis_failed: true` and no `hidden_elements`; the other URLs keep their
+  analysis, and the log names the URL and the exception class, not its message. `MemoryError` speaks
+  of the process, not of the page, and still fails the request. The classifier reads the flag, only
+  when it is `true`, at the top of its rules: `suspicious`/high (`body_analysis_failed`), or
+  `needs_review` on a domain that predates the campaign, as for hidden elements; it comes before the
+  parking and the substantial-content rules, because a failed check is still an active site and would
+  otherwise count as parking or as legitimate. The diff raises `legit_body_analysis_failed` on the
+  client's legitimate domain at every cycle the page keeps failing, since no other signal is left on
+  that URL, and `body_analysis_failed` elsewhere the first cycle a URL fails; both HIGH (a page that
+  could not be checked, not an observed injection). 20 regression tests in
+  `tests/test_body_analysis_failure_code68.py`.
+- **The parse of a page depended on the patch level of Python: on older versions a few bytes of markup
+  made the body analysis of `/http` fail, on newer ones a `<![CDATA[` hid the markup after it
+  (`SEC-51`).** Up to CPython 3.12.11 `HTMLParser` hands every `<![` to
+  `_markupbase.ParserBase.parse_marked_section`, which raises `AssertionError` on an unknown keyword,
+  and calls `set_cdata_mode` without the `escapable` argument that `_TagCollector` passed on, so every
+  page with `<script>` or `<style>` failed as well. From 3.12.12 (and in 3.13) the library opens a real
+  CDATA section on `<![CDATA[` up to `]]>`, while the browser, in HTML content, ends it at the first
+  `>`: the tags in between were invisible to the analysis and live in the page. Measured with
+  standalone CPython builds: 3.12.3, 3.12.8, 3.12.10 and 3.12.11 raise, 3.12.12 and 3.13 hide.
+  **What changes.** `_TagCollector` reads every `<![` up to the first `>` on every version (CDATA
+  support switched off where the library has it, the marked-section grammar replaced where it does
+  not), and passes on to `set_cdata_mode` only what the library gives it. On CPython 3.12.3 the whole
+  detector suite now passes, where ten tests failed before. Inside `<svg>` or `<math>` the browser
+  keeps CDATA, so markup there can now be counted when it is only text: over-counting, never hiding.
+  The oracle of the `SEC-48` and `SEC-50` equivalence tests now keeps `reset` and
+  `parse_marked_section` of the collector, as it already kept `set_cdata_mode`: they are its grammar,
+  not library parsing. 11 regression tests in `tests/test_marked_section_sec51.py`; the end-to-end
+  ones are red only on the versions they describe.
 - **The version constraint on urllib3 allowed versions on which the decompression-bomb cap of
   `SEC-16` does not hold (`SEC-22`).** `requirements.txt` asked for `urllib3>=2,<3`, and the image
   installs from it at build time. Measured with `TestFetchDecompressionBombGuardrail` (requests

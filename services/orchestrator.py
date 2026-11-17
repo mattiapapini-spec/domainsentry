@@ -1180,7 +1180,11 @@ def _fetch_service(name: str, url: str) -> tuple:
     """Single service fetch, returns (name, result_or_None)."""
     try:
         r = _session.get(url, timeout=TIMEOUT)
-        return (name, r.json() if r.ok else None)
+        if not r.ok:
+            # CODE-71: resta «nessun dato», ma con una riga: prima solo le eccezioni lasciavano traccia.
+            logger.warning(f"  {name} error: HTTP {r.status_code} ({sanitize_log_input(url)})")
+            return (name, None)
+        return (name, r.json())
     except Exception as e:
         logger.warning(f"  {name} error: {sanitize_log_input(str(e))}")
         return (name, None)

@@ -425,6 +425,12 @@ def _random_tag_bodies(seed, count):
 
 # ── Oracolo: il parser della libreria standard ────────────────────────────────────────────────
 
+# SEC-51 (modifica giustificata, G5): `reset` (sezioni CDATA spente) e `parse_marked_section` sono, come
+# `set_cdata_mode` per l'iframe, grammatica di `_TagCollector` e non parsing della libreria: l'oracolo li tiene,
+# altrimenti confronterebbe il collector con una grammatica diversa dalla sua invece che col tokenizer standard.
+_COLLECTOR_GRAMMAR = ("__init__", "set_cdata_mode", "unknown_decl", "reset", "parse_marked_section")
+
+
 def _stdlib_parser_methods():
     """I metodi di parsing di `HTMLParser` e della sua base, come li ha la libreria standard in uso: tutti tranne
     i gestori (`handle_*`, `unknown_decl`), `__init__` e `set_cdata_mode`, che `_TagCollector` ridefinisce per
@@ -433,7 +439,7 @@ def _stdlib_parser_methods():
     methods = {}
     for cls in reversed(stdlib.__mro__[:-1]):
         for name, value in vars(cls).items():
-            if isinstance(value, types.FunctionType) and name not in ("__init__", "set_cdata_mode", "unknown_decl") \
+            if isinstance(value, types.FunctionType) and name not in _COLLECTOR_GRAMMAR \
                     and not name.startswith("handle_"):
                 methods[name] = value
     return methods
