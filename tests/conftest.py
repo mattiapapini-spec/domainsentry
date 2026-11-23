@@ -45,6 +45,40 @@ else:
     _auth.PBKDF2_ITERATIONS = 1000
 
 
+def _reputation_cache_off():
+    """Svuota la cache di `services.reputation` e ne azzera il TTL, se il modulo e' gia' importato.
+    Non lo importa qui (non cambia ordine di import ne' log); `sys.modules` da' l'oggetto corrente anche dopo
+    un `importlib.reload`, che riusa lo stesso oggetto modulo."""
+    import sys
+    mod = sys.modules.get("services.reputation")
+    if mod is not None and hasattr(mod, "_rep_cache_clear"):
+        mod._rep_cache_clear()
+        mod.REPUTATION_CACHE_TTL_S = 0.0
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _reputation_cache_off_for_session():
+    """PERF-03: vedi `_reputation_cache_isolated`. A livello di sessione perche' le fixture a scope di classe o
+    di modulo (es. `skipped_chain` in test_reputation_deadline_perf05.py) girano prima di quelle di funzione."""
+    _reputation_cache_off()
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _reputation_cache_isolated():
+    """PERF-03: la cache per dominio di `services.reputation` vive nel modulo e contaminerebbe i test che
+    riusano lo stesso dominio con risposte finte diverse. Due livelli:
+    1. la cache si svuota prima e dopo ogni test;
+    2. il TTL e' 0 (cache di fatto spenta), perche' molti test chiamano `/reputation` piu' volte con lo stesso
+       dominio DENTRO lo stesso test, o in una fixture di classe (un ciclo dopo l'altro, es. `c16(...)` in
+       test_orchestrator.py) e lo svuotamento a inizio test non basterebbe. I test che verificano la cache
+       (tests/test_reputation_auth_sec43.py) ricaricano il modulo, quindi li' il TTL e' quello configurato; il
+       teardown (dopo quello delle loro fixture) lo riporta a 0 dopo l'ultimo `reload`."""
+    _reputation_cache_off()
+    yield
+    _reputation_cache_off()
+
+
 @pytest.fixture
 def sample_dns_result():
     return {

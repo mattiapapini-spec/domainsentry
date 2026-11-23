@@ -31,6 +31,8 @@ services:
       - CASE_INGEST=${CASE_INGEST:-false}
       - SERVICE_TOKEN=${SERVICE_TOKEN:-}
       - CASE_INGEST_TOKEN=${SERVICE_TOKEN:-}
+      # PERF-07 / SEC-43: segreto di /trigger e /reputation, separato da SERVICE_TOKEN
+      - PIPELINE_TOKEN=${PIPELINE_TOKEN:-}
       - INTEL_STORE=${INTEL_STORE:-false}
       - INTEL_DIR=/data/intel
       # Orchestrator URLs — all local in unified mode

@@ -30,7 +30,32 @@ DomainSentry has two trust zones by design (see [README § Security](README.md#s
 - the **authenticated zone** (dashboard and case management) requires authentication for everything
   except login, the health check and the static dashboard page;
 - the **intelligence engine** (orchestrator and collectors) has **no application-level
-  authentication** and must sit on an internal network or loopback.
+  authentication**, with two exceptions below, and must sit on an internal network or loopback.
+
+Two engine endpoints are authenticated because they start work or spend quota:
+
+- `POST /trigger` and `POST /trigger/reset` accept `Authorization: Bearer <PIPELINE_TOKEN>`, or
+  the session of a case-manager user with `manage_cases` (the `service` role is refused).
+  Failure is closed: no credential, an unreachable case-manager or a malformed answer gives
+  401 or 403, never access.
+- `GET /reputation` requires the same Bearer when `PIPELINE_TOKEN` is set; without a token it
+  is open and logs a warning at startup.
+
+About `PIPELINE_TOKEN`:
+
+- generate it with `openssl rand -hex 32` (shorter than 32 characters logs a warning);
+- keep it separate from `SERVICE_TOKEN`, the case-manager's service identity: do not reuse it;
+- rotate it by changing `.env` and restarting orchestrator and reputation;
+- a value of only spaces is a misconfiguration: `/reputation` refuses everyone (fail-closed);
+  an empty value means `/reputation` open and `/trigger` open only to sessions.
+
+Session checks on `/trigger` are limited to `AUTH_REMOTE_MAX_CONCURRENT` (default 4) in flight.
+Residual risk: under a flow of fake tokens from an anonymous client the slots fill, and user
+sessions get 503 on `/trigger` and `/trigger/reset` until it stops; `PIPELINE_TOKEN` and
+`/health` are not affected. Mitigate with a per-IP rate limit on the reverse proxy. A Bearer
+that is not the `PIPELINE_TOKEN` is forwarded to the case-manager as a candidate session token.
+`/intel`, `/status`, `/progress`, `/publish`, the `/feed/*` writes (unless `FEED_REQUIRE_AUTH=true`)
+and the collector ports stay unauthenticated.
 
 In scope, for example:
 
@@ -43,7 +68,9 @@ In scope, for example:
 
 Out of scope:
 
-- using the unauthenticated engine when it has been exposed to an untrusted network,
-  contrary to the documentation (start scans, consume API quotas, occupy workers);
+- using the unauthenticated parts of the engine when it has been exposed to an untrusted
+  network, contrary to the documentation (read intelligence, publish events, occupy workers);
+- the 503 on `/trigger` sessions under an anonymous flood of fake tokens, accepted and
+  documented above;
 - volumetric denial of service against the host;
 - findings that require a malicious operator with shell access to the host.

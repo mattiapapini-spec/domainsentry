@@ -37,7 +37,77 @@ All notable changes to this project will be documented in this file.
   `shared/utils.py` attributes the three expressions to CPython's `Lib/html/parser.py` under the
   Python Software Foundation License.
 
+### Security
+- **`POST /trigger`, `POST /trigger/reset` and `GET /reputation` answered anyone who could reach
+  the port (`PERF-07`, `SEC-43`, provisional IDs).** The orchestrator had no authentication by
+  design, and these three endpoints are the ones that cost something: `/trigger` starts a
+  pipeline run that spends VirusTotal, OTX and SecurityTrails quota and occupies the single
+  pipeline slot (a stuck or hostile caller could also release it with `/trigger/reset`), and
+  `/reputation` spends the same quota on every call, cached or not. In unified mode, where
+  everything shares one port, that meant any host that could reach it. **What changes.**
+  A new secret, `PIPELINE_TOKEN`, separate from `SERVICE_TOKEN` (the case-manager's service
+  identity, which must not be widened). `/trigger` and `/trigger/reset` now run an async
+  dependency before the handler, so a refusal does not touch the pipeline state (no stale-lock
+  recovery, no 409 with `running_since`). They accept `Authorization: Bearer <PIPELINE_TOKEN>`
+  (constant-time comparison, token stripped, an empty or spaces-only token never matches), or a
+  user session verified with `verify_token_remote` against `CASE_MANAGER_URL` that holds
+  `manage_cases`; the `service` role is refused even though it has that permission, since it
+  exists for case ingest. Answers: 401 with `WWW-Authenticate: Bearer`, or 403. Fail-closed:
+  case-manager down, `CASE_MANAGER_URL` empty, a malformed answer or an exception give 401 or
+  403, never 500 and never access. `/reputation` returns 401 before the cache, the sources and
+  the VirusTotal quota when `PIPELINE_TOKEN` is set; without a token it stays open, so the
+  quickstart keeps working, and logs a WARNING at startup; a token of only spaces is a
+  misconfiguration and refuses everyone (with a WARNING). The orchestrator sends the Bearer to
+  `/reputation` only, not to the other services; a 401 or 403 from `/reputation` logs an ERROR
+  that names `PIPELINE_TOKEN`, and the module still counts as failed, not as "no record". Startup
+  WARNINGs for a missing token (then `/trigger` accepts sessions only), a token shorter than 32
+  characters, and `unified.py` with `ENABLE_CASE_MANAGER` false and no token (`/trigger`
+  unreachable). Both compose files pass `PIPELINE_TOKEN`; `docker-compose.prod.yml` also gives the
+  orchestrator `CASE_MANAGER_URL`. **Capped session checks.** The first version verified the
+  session on the default thread pool: in unified mode `/auth/me` hits the same app, and on a real
+  uvicorn with the case-manager, 100 anonymous requests with `Bearer junk` made `/health` take
+  7-10 s and valid sessions fail with 401 after 10-15 s. Verification now runs on a dedicated
+  executor, at most `AUTH_REMOTE_MAX_CONCURRENT` (default 4) in flight; over the cap the answer is
+  503 with `Retry-After: 1` and at most one WARNING every 60 s. The slot is released exactly once,
+  when the work ends or is cancelled (a leak with work still queued was found and fixed in review).
+  Same flood after the fix: `/health` 0.12-0.21 s, `PIPELINE_TOKEN` requests 0.11-0.14 s, a valid
+  session 503 in 0.10-0.12 s. Checked on `tests/test_trigger_auth_perf07.py` and
+  `tests/test_reputation_auth_sec43.py` (98 cases), plus that real uvicorn run. Four rounds of
+  independent verification and of security review. The tests of `TestPipelineLockRecovery` now send
+  a test token: they check the lock, not the authentication.
+  **Breaking.** Every caller of `POST /trigger` that does not come from the dashboard (`curl`,
+  Zabbix, SOAR playbooks) now gets 401 until it sends `Authorization: Bearer $PIPELINE_TOKEN`; the
+  same applies to `/trigger/reset`. With `PIPELINE_TOKEN` set, a direct `GET /reputation` also
+  needs the header. In unified mode with `ENABLE_CASE_MANAGER=false` and no token, `/trigger` is
+  unreachable (401 for everyone). Rotating the token needs a restart of orchestrator and
+  reputation. In production the browser reaches `/trigger` through a reverse proxy outside this
+  repository (the orchestrator is `expose:` only and the dashboard does not proxy it), which must
+  forward the `Authorization` header. **Residual risks, accepted.** (1) Medium: under a flow of
+  fake tokens from an anonymous client the 4 slots fill and user sessions get 503 on `/trigger` and
+  `/trigger/reset` until it stops; `PIPELINE_TOKEN` and `/health` are unaffected; mitigation is a
+  per-IP limit on the reverse proxy. (2) Low: shutdown can be delayed up to 5 s (the executor
+  threads are not daemon); a Bearer that is not the `PIPELINE_TOKEN` is forwarded to the
+  case-manager as a candidate session token. Not changed and still open: `/publish`, `/progress`,
+  `/intel`, `/status` and the collector ports stay anonymous, and so do the `/feed/*` writes with
+  `FEED_REQUIRE_AUTH=false` (the default). `README.md` and `SECURITY.md` describe the new model.
+
 ### Fixed
+- **`/reputation` repeated every call to VirusTotal, OTX and SecurityTrails for the same domain
+  (`PERF-03`, provisional ID).** Each request ran the full collection, so two cycles on the same
+  domain, or two clients monitoring it, paid the quota twice; on the free tier that is 4
+  VirusTotal calls per minute, the scarcest resource of the pipeline. **What changes.** A cache
+  per `(domain in lower case, sources among vt, otx, st)`, modelled on the Certificate
+  Transparency cache: `REPUTATION_CACHE_TTL_S` (default 3600, 0 turns it off),
+  `REPUTATION_CACHE_MAX` (default 1000, oldest entry evicted), a lock, and a deep copy on read and
+  write. Only a result with no source error is stored, or with VirusTotal "not found" as the only
+  one (an unknown domain is an observation, not a fault); a skipped quota slot, the 40 s deadline
+  and HTTP errors are never cached, since a failure is not an absence. `sources` is capped at 64
+  characters so the key cannot be inflated. The cache sits after the authentication check. Known
+  limit: a domain VirusTotal does not know stays cached as unknown for up to one hour. The test
+  fixtures turn the cache off by default (`tests/conftest.py`), because many tests call the same
+  domain with different fakes; the cache tests (`tests/test_reputation_auth_sec43.py`) reload the
+  module with it on. No measurement on real traffic: the saving is the number of repeated
+  `(domain, sources)` calls inside the TTL, each one now answered without a provider call.
 - **One malformed row in the crt.sh JSON lost the whole Certificate Transparency collection of the
   domain (`COL-32`, provisional ID).** `cert_check` processed the rows with no per-row guard, so a
   single row that was not an object, a `common_name` or `name_value` that was not a string (`null`

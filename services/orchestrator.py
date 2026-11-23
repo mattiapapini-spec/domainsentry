@@ -3,9 +3,10 @@ Orchestrator Service (:8010)
 Coordina la pipeline: legge il feed, chiama i servizi, pubblica eventi.
 """
 
-import os, copy, logging, time, threading
+import os, copy, asyncio, logging, time, threading
+from concurrent.futures import ThreadPoolExecutor
 from collections import OrderedDict
-from fastapi import FastAPI, APIRouter, BackgroundTasks
+from fastapi import FastAPI, APIRouter, BackgroundTasks, Depends, Header, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional
@@ -16,6 +17,7 @@ from shared.security import apply_security, sanitize_log_input
 from shared.utils import (now_iso, collection_failed, dns_unknown_rtypes, reputation_source_unobserved,
                           _calc_score, _score_to_level)
 from shared import intel_store
+from shared.auth import verify_token_remote, pipeline_token_ok
 from shared.constants import DEFAULT_DKIM_SELECTORS, DEFAULT_SUBDOMAINS
 
 app = FastAPI(title="Orchestrator", version="4.0.0")
@@ -41,6 +43,40 @@ EVENT_URL = os.environ.get("EVENT_URL", "http://event-publisher:8011")
 CASE_INGEST = os.environ.get("CASE_INGEST", "false").lower() == "true"
 CASE_MANAGER_URL = os.environ.get("CASE_MANAGER_URL", "http://case-manager:8012")
 CASE_INGEST_TOKEN = os.environ.get("CASE_INGEST_TOKEN", "")
+
+# PERF-07: segreto di /trigger, /trigger/reset e (SEC-43) /reputation. Variabile separata da SERVICE_TOKEN,
+# che resta l'identità di servizio del case-manager e non va allargata. Vuoto = nessun token valido.
+PIPELINE_TOKEN = os.environ.get("PIPELINE_TOKEN", "").strip()  # uno spazio finale in .env non conta
+if not PIPELINE_TOKEN:
+    logger.warning("PERF-07: PIPELINE_TOKEN non configurato: POST /trigger accetta solo sessioni del "
+                   "case-manager con manage_cases" + ("" if CASE_MANAGER_URL else
+                   "; CASE_MANAGER_URL è vuoto, quindi risponderà sempre 401"))
+elif len(PIPELINE_TOKEN) < 32:
+    logger.warning("PERF-07: PIPELINE_TOKEN più corto di 32 caratteri: troppo debole, "
+                   "generalo con `openssl rand -hex 32`")
+
+# PERF-07: la verifica remota di una sessione blocca un thread fino a 5 s. In modalità unificata `/auth/me`
+# colpisce la stessa app: con il pool di default di anyio, un flusso di token falsi lo satura e affama /health e
+# le sessioni valide. Pool dedicato e tetto alle verifiche in volo; oltre il tetto, 503 immediato.
+AUTH_REMOTE_MAX_CONCURRENT = max(1, int(os.environ.get("AUTH_REMOTE_MAX_CONCURRENT", "4")))
+_auth_remote_slots = threading.BoundedSemaphore(AUTH_REMOTE_MAX_CONCURRENT)
+_auth_remote_pool = ThreadPoolExecutor(max_workers=AUTH_REMOTE_MAX_CONCURRENT, thread_name_prefix="orch-auth")
+# Un 503 per tetto raggiunto lascia al più un WARNING per finestra: sotto un flusso di token falsi sarebbe un log flood.
+_AUTH_BUSY_WARN_WINDOW_S = 60.0
+_auth_busy_last_warn = None
+_auth_busy_warn_lock = threading.Lock()
+
+
+def _auth_busy_warn():
+    global _auth_busy_last_warn
+    with _auth_busy_warn_lock:
+        now = time.monotonic()
+        if _auth_busy_last_warn is not None and now - _auth_busy_last_warn < _AUTH_BUSY_WARN_WINDOW_S:
+            return
+        _auth_busy_last_warn = now
+    logger.warning("PERF-07: tetto delle verifiche remote raggiunto (AUTH_REMOTE_MAX_CONCURRENT=%d): "
+                   "richieste rifiutate con 503", AUTH_REMOTE_MAX_CONCURRENT)
+
 
 # Intelligence persistence (opt-in): store full per-domain snapshot + diff history
 # for the dashboard Intelligence tab.
@@ -213,7 +249,52 @@ class TriggerRequest(BaseModel):
     variant_intel: bool = False  # gather full intel on dnstwist variants (slower, opt-in)
 
 
-@router.post("/trigger", tags=["Pipeline"])
+async def _require_pipeline_auth(authorization: Optional[str] = Header(None)):
+    """PERF-07: chi avvia o sblocca la pipeline è il PIPELINE_TOKEN o un utente con `manage_cases`.
+
+    Gira prima del corpo dell'handler: un rifiuto non tocca `_running` (niente recupero dello stale,
+    niente 409 con `running_since`). Fail-closed: case-manager giù o URL vuoto = nessuna sessione valida.
+    Async perché il controllo locale non deve passare dal pool di thread e la verifica remota ha il suo."""
+    if pipeline_token_ok(authorization, PIPELINE_TOKEN):
+        return None
+    deny = HTTPException(401, "Authentication required", headers={"WWW-Authenticate": "Bearer"})
+    if not authorization or not authorization.startswith("Bearer ") or not CASE_MANAGER_URL:
+        raise deny
+    token = authorization[7:].strip()
+    if not token:
+        raise deny
+    slots = _auth_remote_slots  # lo stesso oggetto per acquire e release di questa richiesta
+    if not slots.acquire(blocking=False):
+        _auth_busy_warn()
+        raise HTTPException(503, "Authentication service busy", headers={"Retry-After": "1"})
+    try:
+        cf = _auth_remote_pool.submit(verify_token_remote, token, CASE_MANAGER_URL)
+    except Exception as e:  # executor chiuso: il lavoro non è partito e nessun callback libererà il posto
+        slots.release()
+        logger.warning(f"PERF-07: verifica della sessione non avviata ({type(e).__name__})")
+        raise deny from None
+    # Unico punto di rilascio: il callback scatta una volta sola, a lavoro finito (anche con eccezione) o se il
+    # future è cancellato prima di partire. Una richiesta annullata mentre il thread gira lascia il posto occupato.
+    cf.add_done_callback(lambda _f: slots.release())
+    try:
+        user = await asyncio.wrap_future(cf)
+    except Exception as e:
+        # solo il tipo: il messaggio potrebbe contenere l'URL o il token
+        logger.warning(f"PERF-07: verifica della sessione fallita ({type(e).__name__})")
+        raise deny from None
+    # L1: la risposta del case-manager non è fidata oltre la forma attesa
+    if not isinstance(user, dict):
+        raise deny
+    role, perms = user.get("role"), user.get("permissions")
+    if not isinstance(role, str) or not role or not isinstance(perms, list):
+        raise HTTPException(403, "Permission required: manage_cases")
+    # L'identità di servizio ha manage_cases (serve all'ingest dei casi) ma non deve avviare scansioni.
+    if role.strip().lower() == "service" or "manage_cases" not in perms:
+        raise HTTPException(403, "Permission required: manage_cases")
+    return user
+
+
+@router.post("/trigger", tags=["Pipeline"], dependencies=[Depends(_require_pipeline_auth)])
 def trigger(req: TriggerRequest, background_tasks: BackgroundTasks):
     """Triggera la pipeline in background."""
     global _running, _run_started
@@ -246,7 +327,7 @@ def trigger(req: TriggerRequest, background_tasks: BackgroundTasks):
             "variant_intel": req.variant_intel, "timestamp": now_iso()}
 
 
-@router.post("/trigger/reset", tags=["Pipeline"])
+@router.post("/trigger/reset", tags=["Pipeline"], dependencies=[Depends(_require_pipeline_auth)])
 def trigger_reset():
     """Force-release the pipeline lock.
 
@@ -254,8 +335,7 @@ def trigger_reset():
     SIGKILL / container crash) and left `_running` stuck, blocking all new scans
     with 409. The heartbeat check in /trigger auto-recovers after HEARTBEAT_STALE_SEC,
     but this lets an operator unblock immediately without restarting the service.
-    Follows the orchestrator's network-isolation model (no app-level auth; reachable
-    only from the internal network / dashboard)."""
+    PERF-07: richiede PIPELINE_TOKEN o una sessione con manage_cases, come /trigger."""
     global _running
     was_running = _running
     since_beat = time.time() - _last_heartbeat if was_running else 0
@@ -1261,10 +1341,18 @@ def _run_pipeline(req: TriggerRequest):
         _running = False
 
 
-def _fetch_service(name: str, url: str) -> tuple:
-    """Single service fetch, returns (name, result_or_None)."""
+def _fetch_service(name: str, url: str, headers: dict = None) -> tuple:
+    """Single service fetch, returns (name, result_or_None).
+
+    `headers` vale per questa sola richiesta (SEC-43: il PIPELINE_TOKEN va solo a /reputation, non agli
+    header di `_session` che servono tutti i servizi)."""
     try:
-        r = _session.get(url, timeout=TIMEOUT)
+        r = _session.get(url, timeout=TIMEOUT, **({"headers": headers} if headers else {}))
+        if r.status_code in (401, 403) and name == "reputation":
+            # SEC-43: un rifiuto di autenticazione non è un «HTTP 4xx» generico: il token manca o non coincide.
+            logger.error(f"  {name} error: HTTP {r.status_code} autenticazione rifiutata, "
+                         f"controlla PIPELINE_TOKEN su orchestrator e reputation")
+            return (name, None)
         if not r.ok:
             # CODE-71: resta «nessun dato», ma con una riga: prima solo le eccezioni lasciavano traccia.
             logger.warning(f"  {name} error: HTTP {r.status_code} ({sanitize_log_input(url)})")
@@ -1300,7 +1388,10 @@ def _gather_intelligence(domain: str, req: TriggerRequest) -> dict:
 
     # Esegui in parallelo (guard contro tasks vuoto)
     with ThreadPoolExecutor(max_workers=max(len(tasks), 1)) as executor:
-        futures = [executor.submit(_fetch_service, name, url) for name, url in tasks]
+        # SEC-43: il PIPELINE_TOKEN, se configurato, accompagna la sola chiamata a /reputation
+        rep_headers = {"Authorization": f"Bearer {PIPELINE_TOKEN}"} if PIPELINE_TOKEN else None
+        futures = [executor.submit(_fetch_service, name, url, rep_headers if name == "reputation" else None)
+                   for name, url in tasks]
         for future in futures:
             name, result = future.result()
             intel[name] = result

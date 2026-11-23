@@ -147,6 +147,24 @@ class TestPipelineLockRecovery:
     """A pipeline that dies without cleanup (OOM/SIGKILL/crash) must not block all
     future scans forever. Heartbeat staleness auto-recovers; a manual reset exists too."""
 
+    # PERF-07: `POST /trigger` e `POST /trigger/reset` ora richiedono `Authorization: Bearer <PIPELINE_TOKEN>`
+    # (o una sessione utente con manage_cases). Questi test verificano il LOCK (heartbeat, 409, reset), non
+    # l'autenticazione, che sta in tests/test_trigger_auth_perf07.py: per questo mandano un PIPELINE_TOKEN di
+    # test. Cambia solo l'header della richiesta; le asserzioni sul lucchetto sono quelle di prima.
+    _PTOKEN = "test-pipeline-token-not-a-secret"
+    _AUTH = {"Authorization": f"Bearer {_PTOKEN}"}
+
+    @pytest.fixture(autouse=True)
+    def _pipeline_token(self, monkeypatch):
+        monkeypatch.setenv("PIPELINE_TOKEN", self._PTOKEN)
+        monkeypatch.setenv("INTEL_STORE", "false")
+        monkeypatch.setenv("CASE_INGEST", "false")
+        import services.orchestrator as o
+        importlib.reload(o)
+        yield
+        monkeypatch.undo()
+        importlib.reload(o)
+
     def _client(self):
         import services.orchestrator as o
         from fastapi.testclient import TestClient
@@ -158,7 +176,7 @@ class TestPipelineLockRecovery:
         o._running = True
         o._run_started = time.time() - 100
         o._last_heartbeat = time.time() - (o.HEARTBEAT_STALE_SEC + 60)
-        r = c.post("/trigger", json={"client": "X"})
+        r = c.post("/trigger", json={"client": "X"}, headers=self._AUTH)
         assert r.status_code == 200  # auto-reset, not blocked
         o._running = False
 
@@ -168,7 +186,7 @@ class TestPipelineLockRecovery:
         o._running = True
         o._run_started = time.time() - 100
         o._last_heartbeat = time.time() - 30  # alive
-        r = c.post("/trigger", json={"client": "X"})
+        r = c.post("/trigger", json={"client": "X"}, headers=self._AUTH)
         assert r.status_code == 409
         o._running = False
 
@@ -177,7 +195,7 @@ class TestPipelineLockRecovery:
         o, c = self._client()
         o._running = True
         o._last_heartbeat = time.time() - 30
-        r = c.post("/trigger/reset")
+        r = c.post("/trigger/reset", headers=self._AUTH)
         assert r.status_code == 200
         assert r.json()["was_running"] is True
         assert o._running is False
