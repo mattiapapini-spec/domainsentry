@@ -94,3 +94,16 @@ def verify_token_remote(token: str, case_manager_url: str, session=None, timeout
         # Any failure → fail closed (treat as invalid).
         return None
     return None
+
+
+def pipeline_token_ok(authorization_header, expected_token: str) -> bool:
+    """SEC-43 / PERF-07: True se l'header è `Bearer <expected_token>`.
+
+    Il token atteso è un parametro (letto dall'env dal modulo chiamante all'import),
+    non una lettura qui. Un token atteso vuoto o di soli spazi non autentica mai: senza la
+    guardia `Bearer ` (token vuoto) coinciderebbe con un PIPELINE_TOKEN non configurato.
+    """
+    if not expected_token or not expected_token.strip() or not authorization_header or not authorization_header.startswith("Bearer "):
+        return False
+    # bytes: compare_digest su str con caratteri non ASCII solleva TypeError (500 invece di 401)
+    return hmac.compare_digest(authorization_header[7:].encode("utf-8"), expected_token.encode("utf-8"))

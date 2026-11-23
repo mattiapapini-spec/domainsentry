@@ -29,6 +29,9 @@ curl http://localhost:8000/docs      # Swagger UI
 curl "http://localhost:8000/dns?domain=example.com&full=true"
 ```
 
+To start scans with `POST /trigger`, set `PIPELINE_TOKEN` in `.env` first (`openssl rand -hex 32`)
+and send it as `Authorization: Bearer ...`; see [Security](#security).
+
 ## Features
 
 ### Intelligence engine
@@ -110,13 +113,30 @@ plus per-permission overrides). These are safe to expose behind a reverse proxy.
 
 ### Unauthenticated zone (intelligence engine) — network isolation required
 
-The **orchestrator** and the individual intelligence services (`/intel`, `/trigger`,
-`/status`, `/progress`, `/events`, and the per-service endpoints on ports 8001–8011)
-have **no application-level authentication, by design**. They are the internal engine,
-intended to sit on a private network and be reachable only by the orchestrator and the
-case-manager — not by end users.
+The **orchestrator** and the individual intelligence services (`/intel`, `/status`,
+`/progress`, `/events`, and the per-service endpoints on ports 8001–8011) have **no
+application-level authentication, by design**. They are the internal engine, intended to
+sit on a private network and be reachable only by the orchestrator and the case-manager —
+not by end users.
 
-The chosen mitigation is **network isolation**, not app-level auth:
+Two engine endpoints are the exception, because they spend money or start work:
+
+- `POST /trigger` and `POST /trigger/reset` need either `Authorization: Bearer
+  $PIPELINE_TOKEN`, or a case-manager session of a user with the `manage_cases`
+  permission (the `service` role is excluded). With neither, the answer is 401 or 403
+  and the pipeline state is not touched. This is how the dashboard starts a scan.
+- `GET /reputation` needs `Authorization: Bearer $PIPELINE_TOKEN` when the token is
+  set, because each call can spend VirusTotal, OTX and SecurityTrails quota. With no
+  token configured it stays open (so the quickstart keeps working) and the service logs
+  a warning at startup. The orchestrator sends the token to `/reputation` by itself.
+
+`PIPELINE_TOKEN` is a long random secret (`openssl rand -hex 32`), separate from
+`SERVICE_TOKEN`. Set it in `.env` before using `/trigger` from `curl`, SOAR or Zabbix.
+Without it `/trigger` accepts only dashboard sessions, and in unified mode without
+`ENABLE_CASE_MANAGER=true` it is unreachable. A token made only of spaces closes
+`/reputation` to everyone.
+
+The chosen mitigation for everything else is **network isolation**, not app-level auth:
 
 - **Production (recommended):** deploy with `docker-compose.prod.yml` (separate
   containers on an internal Docker network). Only `dashboard` and `case-manager` publish
@@ -125,7 +145,12 @@ The chosen mitigation is **network isolation**, not app-level auth:
   never from the host or outside. Put a reverse proxy in front of the published dashboard
   port that forwards only the authenticated paths (`/auth`, `/cases`, `/summary`).
   Example nginx: proxy `location /` and `location /auth`, `location /cases` to the
-  dashboard/case-manager; do **not** add a proxy pass for the orchestrator.
+  dashboard/case-manager; do **not** add a proxy pass for the orchestrator, except for
+  `/trigger` and `/trigger/reset` if analysts start scans from the dashboard in the
+  browser: the orchestrator is `expose:` only and the dashboard does not proxy it, so
+  those two paths need a proxy pass that forwards the `Authorization` header, and
+  nothing else. The orchestrator checks the session itself, and a rate limit per IP on
+  the proxy is advised (see below).
 - **Unified mode (evaluation only):** everything runs on one port, so the orchestrator
   endpoints ARE reachable by anyone who can reach that port. `docker-compose.yml` binds
   it to `127.0.0.1` by default (`BIND_ADDR` in `.env`, default `127.0.0.1`), so out of
@@ -139,7 +164,8 @@ The chosen mitigation is **network isolation**, not app-level auth:
 path-filtering reverse proxy in front, and do not port-forward the
 orchestrator/intelligence ports in production mode. If you need authenticated
 programmatic access to the engine, put it behind the case-manager (which does
-authenticate) or add your own gateway.
+authenticate) or add your own gateway. `POST /trigger` with `PIPELINE_TOKEN` is the one
+supported direct call.
 
 ### Operational notes
 
@@ -172,8 +198,19 @@ authenticate) or add your own gateway.
 Know these before running DomainSentry in production:
 
 - **Keep the engine unreachable from untrusted networks.** Anyone who can reach the
-  unauthenticated zone can start scans, spend your VirusTotal, OTX and SecurityTrails
-  quotas, and occupy worker capacity. Network isolation is the control (see above).
+  unauthenticated zone can read the intelligence, publish events and occupy worker
+  capacity. Starting scans and spending your VirusTotal, OTX and SecurityTrails quotas
+  need `PIPELINE_TOKEN` (or a session with `manage_cases`), but only while the token is
+  set: with no token `/reputation` is open. Network isolation is still the main control.
+- **Session checks on `/trigger` are capped.** At most `AUTH_REMOTE_MAX_CONCURRENT`
+  (default 4) sessions are verified against the case-manager at once, on a dedicated
+  thread pool, so a flood of fake tokens cannot stall `/health`. Over the cap the answer
+  is 503 with `Retry-After: 1`. While such a flood lasts, dashboard users get 503 on
+  `/trigger` and `/trigger/reset`; `PIPELINE_TOKEN` and `/health` are not affected. Limit
+  requests per IP on the reverse proxy.
+- **Reputation cache.** `/reputation` keeps a result per domain and source set for
+  `REPUTATION_CACHE_TTL_S` (default 3600 s), only when no source reported an error. A
+  domain VirusTotal does not know stays cached as such until the TTL expires.
 - **Unified mode shares one worker pool** between the engine, the dashboard and login.
   Heavy or slow engine traffic can delay the dashboard. For multi-analyst use, prefer the
   production split, where each service has its own process.
@@ -248,7 +285,7 @@ curl "http://localhost:8000/http?domain=example.com"
 # WHOIS
 curl "http://localhost:8000/whois?domain=example.com"
 
-# Reputation (requires API keys in .env)
+# Reputation (requires API keys in .env; add -H "Authorization: Bearer $PIPELINE_TOKEN" when the token is set)
 curl "http://localhost:8000/reputation?domain=example.com"
 
 # Permutation scan (slow, 30-120s)
@@ -293,8 +330,9 @@ curl -X POST "http://localhost:8000/feed/whitelist?client=acme" \
   -H "Content-Type: application/json" \
   -d '{"domain": "example-corp.com", "reason": "Verified independent business"}'
 
-# Trigger monitoring pipeline
+# Trigger monitoring pipeline (PIPELINE_TOKEN from .env; without it the call gets 401)
 curl -X POST "http://localhost:8000/trigger" \
+  -H "Authorization: Bearer $PIPELINE_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"client": "acme", "include_dnstwist": true}'
 ```
@@ -323,7 +361,7 @@ All endpoints available on port 8000 (unified) or individual ports (production).
 | GET | `/cert?domain=&tls_live=true` | Certificate Transparency + TLS |
 | GET | `/http?domain=&detect_hidden=true` | HTTP fingerprint + hidden elements |
 | GET | `/whois?domain=` | WHOIS structured lookup |
-| GET | `/reputation?domain=&sources=vt,otx,st` | Multi-source reputation + risk score |
+| GET | `/reputation?domain=&sources=vt,otx,st` | Multi-source reputation + risk score (Bearer `PIPELINE_TOKEN` when set) |
 | GET | `/twist?domain=&registered_only=true` | dnstwist permutation scan |
 
 ### Classification
@@ -353,7 +391,8 @@ All endpoints available on port 8000 (unified) or individual ports (production).
 | GET | `/` | Service index |
 | GET | `/health` | Health check |
 | GET | `/status` | All services health (prod mode) |
-| POST | `/trigger` | Trigger pipeline run |
+| POST | `/trigger` | Trigger pipeline run (Bearer `PIPELINE_TOKEN` or a `manage_cases` session) |
+| POST | `/trigger/reset` | Release a stuck pipeline lock (same authentication) |
 | GET | `/events?client=&last=50` | Read SOC events |
 | POST | `/publish` | Publish events |
 | GET | `/docs` | Swagger UI (auto-generated) |
@@ -415,6 +454,9 @@ compose files (for example `TOKEN_TTL_HOURS=12`, and `TARGET_WEBHOOK_ENABLED: "f
 | `LOGIN_MAX_FAILURES` / `LOGIN_WINDOW_SEC` | 5 / 300 | Failed logins allowed per client IP in the window |
 | `FEED_REQUIRE_AUTH` | `false` | Require a valid token on feed write endpoints (needs the case-manager) |
 | `CASE_INGEST` / `SERVICE_TOKEN` | `false` / | Turn every pipeline event into a case; the token is a long random service-to-service secret (`openssl rand -hex 32`) |
+| `PIPELINE_TOKEN` | | Secret of `POST /trigger`, `/trigger/reset` and `GET /reputation`; separate from `SERVICE_TOKEN`, at least 32 characters (`openssl rand -hex 32`). Empty: `/trigger` accepts only `manage_cases` sessions and `/reputation` is open. Rotate by restarting orchestrator and reputation |
+| `AUTH_REMOTE_MAX_CONCURRENT` | 4 | Session checks in flight on `/trigger`; over the cap, 503 (not passed by the compose files) |
+| `REPUTATION_CACHE_TTL_S` / `REPUTATION_CACHE_MAX` | 3600 / 1000 | `/reputation` cache lifetime in seconds (`0` disables it) and maximum entries (not passed by the compose files) |
 | `INTEL_STORE` | `false` | Persist per-domain intelligence snapshots and baseline-diff history (dashboard Intelligence tab) |
 | `WHOIS_ONLY_DOMAINS` | | Comma-separated lookalikes for which a WHOIS-only collection is attempted even when they do not resolve |
 | `SSRF_PROTECTION` | `true` | Refuse outbound requests to internal addresses; keep `true` outside offline labs |
@@ -440,12 +482,12 @@ Complements the native [dnstwist XSOAR pack](https://cortex.marketplace.pan.dev/
 Playbook: Domain Intelligence Enrichment
   Step 1: !dnstwist domain=${domain}                    ← native XSOAR pack
   Step 2: GET http://domainsentry:8000/dns?domain=${domain}&full=true
-  Step 3: GET http://domainsentry:8000/reputation?domain=${domain}
+  Step 3: GET http://domainsentry:8000/reputation?domain=${domain}   ← header Authorization: Bearer ${PIPELINE_TOKEN} when set
   Step 4: POST http://domainsentry:8000/classify/variant body=${aggregated}
   Step 5: Populate War Room
 ```
 
-Zabbix integration: external check triggers `POST /trigger`, trapper items receive risk scores.
+Zabbix integration: external check triggers `POST /trigger` with the header `Authorization: Bearer <PIPELINE_TOKEN>`, trapper items receive risk scores.
 
 ## Development
 
@@ -492,7 +534,7 @@ PYTHONPATH=. pytest tests/ -q
 ## Roadmap
 
 - [ ] Async orchestrator with `httpx` (parallel intelligence gathering)
-- [ ] Authentication on the intelligence engine (today it relies on network isolation)
+- [ ] Authentication on the rest of the intelligence engine (`/trigger` and `/reputation` are covered; `/intel`, `/status`, `/progress`, `/publish` and the collectors still rely on network isolation)
 - [ ] Per-process capacity limits for the unauthenticated endpoints in unified mode
 - [ ] Prometheus metrics (`/metrics`)
 - [ ] Request ID tracing across services

@@ -257,6 +257,10 @@ if ENABLE_CASE_MANAGER:
         from services.dashboard import router as dash_router
         app.include_router(dash_router)
         logger.info("Dashboard enabled at /dashboard")
+elif not os.environ.get("PIPELINE_TOKEN", "").strip():
+    # PERF-07: senza case-manager non esistono sessioni utente, e senza PIPELINE_TOKEN nessuno avvia scansioni
+    logger.warning("PERF-07: ENABLE_CASE_MANAGER è falso e PIPELINE_TOKEN è vuoto: "
+                   "POST /trigger è irraggiungibile (401 per tutti)")
 
 
 @app.get("/health")

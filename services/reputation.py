@@ -3,11 +3,13 @@ Reputation Service (:8005)
 Modulo 9 estratto — VirusTotal, AlienVault OTX, SecurityTrails + risk scoring.
 """
 
-import os, logging, time, threading, math
-from fastapi import FastAPI, APIRouter, Query
+import os, copy, logging, time, threading, math
+from collections import OrderedDict
+from fastapi import FastAPI, APIRouter, Query, Header, HTTPException
 from fastapi.responses import JSONResponse
 
 from shared.security import apply_security, sanitize_error, sanitize_log_input
+from shared.auth import pipeline_token_ok
 from shared.constants import VT_NOT_FOUND_ERROR
 from shared.utils import now_iso, _calc_score, _score_to_level
 
@@ -26,6 +28,22 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [REP] %(message)s")
 VT_API_KEY = os.environ.get("VT_API_KEY", "")
 OTX_API_KEY = os.environ.get("OTX_API_KEY", "")
 ST_API_KEY = os.environ.get("ST_API_KEY", "")
+
+# SEC-43: con PIPELINE_TOKEN configurato `/reputation` richiede `Authorization: Bearer`, perché ogni chiamata
+# non autenticata consumerebbe quota VT/OTX/ST. Senza token resta aperta (uso standalone), con un avviso.
+_pipeline_token_raw = os.environ.get("PIPELINE_TOKEN", "")
+PIPELINE_TOKEN = _pipeline_token_raw.strip()  # SEC-43: uno spazio finale in .env non conta
+# Un valore fatto di soli spazi è una configurazione sbagliata, non l'assenza di token: fail-closed, nessuno entra
+# (con l'assenza, invece, /reputation resta aperta come prima).
+PIPELINE_TOKEN_REQUIRED = bool(_pipeline_token_raw)
+if PIPELINE_TOKEN_REQUIRED and not PIPELINE_TOKEN:
+    logger.warning("SEC-43: PIPELINE_TOKEN contiene solo spazi: /reputation rifiuta ogni richiesta (401)")
+elif not PIPELINE_TOKEN:
+    logger.warning("SEC-43: PIPELINE_TOKEN non configurato: /reputation è aperta e ogni chiamante "
+                   "può consumare la quota VT/OTX/ST")
+elif len(PIPELINE_TOKEN) < 32:
+    logger.warning("SEC-43: PIPELINE_TOKEN più corto di 32 caratteri: troppo debole, "
+                   "generalo con `openssl rand -hex 32`")
 
 # PERF-01: token bucket condiviso per VT (free tier: 4 richieste/60s), sullo
 # stesso principio del rate limiter WHOIS (whois_intel.py:65-71) — regola il
@@ -161,6 +179,59 @@ def _vt_wait_for_slot():
         _vt_rate_lock.release()
 
 
+# PERF-03: cache per (dominio, fonti) sul modello di _ct_cache (cert_intel.py): TTL, massimo di voci con
+# sfratto della più vecchia, lucchetto. Un esito si salva solo se nessuna fonte ha `error` (vedi
+# _reputation_cacheable): VT_SKIPPED_ERROR, REPUTATION_DEADLINE_ERROR e i 404/HTTP errati si ritentano.
+def _parse_cache_ttl():
+    # L2: 0 spegne la cache; _parse_rate_env rifiuta lo 0, quindi lo si riconosce prima, solo per questa variabile
+    raw = os.environ.get("REPUTATION_CACHE_TTL_S")
+    try:
+        if raw is not None and float(raw) == 0:
+            return 0.0
+    except ValueError:
+        pass
+    return _parse_rate_env("REPUTATION_CACHE_TTL_S", float, 3600.0)
+
+
+REPUTATION_CACHE_TTL_S = _parse_cache_ttl()
+REPUTATION_CACHE_MAX = _parse_rate_env("REPUTATION_CACHE_MAX", int, 1000)
+_rep_cache = OrderedDict()
+_rep_cache_lock = threading.Lock()
+
+
+def _rep_cache_get(key):
+    """Ritorna una copia dell'esito se presente e entro il TTL, altrimenti None."""
+    with _rep_cache_lock:
+        cached = _rep_cache.get(key)
+        if cached and (time.monotonic() - cached[0]) < REPUTATION_CACHE_TTL_S:
+            return copy.deepcopy(cached[1])
+        _rep_cache.pop(key, None)
+    return None
+
+
+def _rep_cache_set(key, result):
+    if REPUTATION_CACHE_TTL_S <= 0:
+        return  # cache spenta
+    with _rep_cache_lock:
+        _rep_cache.pop(key, None)
+        while len(_rep_cache) >= REPUTATION_CACHE_MAX:
+            _rep_cache.popitem(last=False)
+        _rep_cache[key] = (time.monotonic(), copy.deepcopy(result))
+
+
+def _rep_cache_clear():
+    """Svuota la cache (per i test)."""
+    with _rep_cache_lock:
+        _rep_cache.clear()
+
+
+def _reputation_cacheable(result) -> bool:
+    # L2: il 404 di VT è un'osservazione (dominio sconosciuto), non un guasto: da solo si memorizza
+    return not any(isinstance(result.get(k), dict) and result[k].get("error")
+                   and result[k]["error"] != VT_NOT_FOUND_ERROR
+                   for k in ("virustotal", "otx", "securitytrails"))
+
+
 @app.get("/health")
 def health():
     return {"status": "healthy", "service": "reputation", "version": "4.0.0",
@@ -170,10 +241,19 @@ def health():
 @router.get("/reputation", tags=["Reputation"])
 def reputation_check(
     domain: str = Query(..., min_length=4, max_length=253, pattern=r"^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}$"),
-    sources: str = Query("vt,otx,st", description="Comma-separated sources")
+    sources: str = Query("vt,otx,st", max_length=64, description="Comma-separated sources"),
+    authorization: str = Header(None)
 ):
+    # SEC-43: prima di tutto, cache compresa: niente lavoro né quota per chi non è autenticato
+    if PIPELINE_TOKEN_REQUIRED and not pipeline_token_ok(authorization, PIPELINE_TOKEN):
+        raise HTTPException(401, "Authentication required", headers={"WWW-Authenticate": "Bearer"})
     logger.info(f"Check: {sanitize_log_input(domain)} sources={sources}")
     requested = set(s.strip() for s in sources.split(","))
+    # PERF-03: dominio in minuscolo e solo fonti note, così maiuscole e fonti ignote non dividono la voce
+    cache_key = (domain.lower(), tuple(sorted(requested & {"vt", "otx", "st"})))
+    cached = _rep_cache_get(cache_key)
+    if cached is not None:
+        return JSONResponse(content=cached)
 
     result = {
         "domain": domain, "timestamp": now_iso(),
@@ -215,6 +295,8 @@ def reputation_check(
     result["risk_score"] = _calc_score(result)
     result["risk_level"] = _score_to_level(result["risk_score"])
 
+    if _reputation_cacheable(result):
+        _rep_cache_set(cache_key, result)
     return JSONResponse(content=result)
 
 

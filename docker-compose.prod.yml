@@ -90,6 +90,7 @@ services:
       VT_API_KEY: ${VT_API_KEY:-}
       OTX_API_KEY: ${OTX_API_KEY:-}
       ST_API_KEY: ${ST_API_KEY:-}
+      PIPELINE_TOKEN: ${PIPELINE_TOKEN:-}  # SEC-43: /reputation accetta solo l'orchestrator
     expose:
       - "8005"
 
@@ -135,6 +136,8 @@ services:
       TWIST_URL: http://dnstwist-engine:8006
       CLASSIFY_URL: http://classifier:8007
       EVENT_URL: http://event-publisher:8011
+      PIPELINE_TOKEN: ${PIPELINE_TOKEN:-}  # PERF-07: /trigger; SEC-43: lo manda a /reputation
+      CASE_MANAGER_URL: http://case-manager:8012  # PERF-07: verifica delle sessioni utente (dashboard)
     expose:
       - "8010"
     depends_on:
