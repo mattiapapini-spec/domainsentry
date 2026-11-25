@@ -498,7 +498,8 @@ class TestServiceToken:
     def _reload_with_service_token(self, monkeypatch, token):
         import importlib
         monkeypatch.setenv("SERVICE_TOKEN", token)
-        monkeypatch.setenv("CASES_DB", "/tmp/cm_svc.db")
+        # BUILD-05: DB nuovo a ogni chiamata, un path fisso in /tmp sopravvive fra esecuzioni
+        monkeypatch.setenv("CASES_DB", os.path.join(tempfile.mkdtemp(), "cm_svc.db"))
         monkeypatch.setenv("ADMIN_PASSWORD", "admin_password_123")
         import services.case_manager as cm
         importlib.reload(cm)

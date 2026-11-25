@@ -26,10 +26,10 @@ primo gli altri non cambiano nulla; uno che il driver riceve già ignorato (`noh
 resta ignorato. Se la directory non sparisce del tutto il driver ne stampa il percorso ed esce con errore.
 
 Limiti:
-- tests/test_feed_manager.py fissa FEED_DATA su un percorso fisso all'import, cioè in ogni parte, e
-  alcuni test di quel modulo e di tests/test_case_manager.py usano altri percorsi fissi: lì lo stato
-  non è per processo, e due driver (o un driver e una suite in serie) lanciati insieme possono
-  collidere;
+- lo stato di tests/test_feed_manager.py e di tests/test_case_manager.py sta in directory temporanee
+  nuove (mkdtemp, sotto il TMPDIR della parte), non più in percorsi fissi in /tmp (BUILD-05): due
+  driver lanciati insieme non collidono su quei percorsi. Un test nuovo con un percorso fisso lo
+  reintrodurrebbe, e nessun controllo lo intercetta fuori dai 6 test coperti;
 - nessun limite di tempo per processo: un processo appeso tiene fermo il driver finché non lo si
   interrompe;
 - un processo che un test stacca dal gruppo della parte (una sessione o un gruppo propri) e non ferma

@@ -38,6 +38,36 @@ All notable changes to this project will be documented in this file.
   Python Software Foundation License.
 
 ### Fixed
+- **The test suite failed on the second run on the same machine, 6 tests, while CI stayed green
+  (`BUILD-05`).** In a cloud session `pytest tests/` gave 6 failed:
+  `TestServiceToken::test_service_token_can_ingest`,
+  `TestFeedWriteAuth::test_auth_disabled_write_open` and
+  `::test_auth_enabled_valid_token_with_permission`,
+  `TestClientOnboard::test_onboard_adds_domains_and_notes` and
+  `::test_onboard_skips_invalid_and_duplicates`, and `TestPromoteDomain::test_promote_resolves_legitimate`.
+  **Why.** Those tests kept their state in fixed paths (`/tmp/cm_svc.db`, `/tmp/test_feed_data`,
+  `/tmp/test_feed_auth`) that survive between runs: the second ingest, onboard or promote of the same
+  domain became a duplicate (400, `added_count` 0, `created` not true). On top of that
+  `TestClientOnboard`, `TestPromoteDomain` and `TestWhitelistReadOnlyStorage` set `FEED_FILE`, which
+  `services/feed_manager.py` never reads (it reads only `FEED_DATA`), so their `tmp_path` isolated
+  nothing. CI is green only because every runner starts with an empty `/tmp`: the first run on a
+  machine passes, the second fails. It is not the environment (Python 3.13 against 3.12, dependencies,
+  DNS, network): the failure reproduces exactly with only the dirty state, and the tests use no network.
+  **What changes.** Tests only, no service code. The case DB and the two feed directories are now
+  created with `tempfile.mkdtemp` at every use (under `TMPDIR`), and the three classes set `FEED_DATA`
+  to a directory under `tmp_path`. The previous entries on the parallel driver and on `CODE-51` left
+  "fixed paths reused between runs" as tracked separately: this is that entry. **Measured.** The new
+  regression test `tests/test_fixed_tmp_paths_build05.py` runs the 6 tests twice in a row in
+  subprocesses with a fresh state: red before (1 failed, 6 failed in the subprocess), green after
+  (1 passed, about 1.6 s). The 6 tests pass 3 times in a row with a dirty `/tmp`. Serial suite
+  (`DOMAINSENTRY_REQUIRE_NODE=1`), twice: 4417 passed, 1 skipped, about 200 s; parallel driver
+  (`-n 4`): 4418 collected, 4418 run, 4417 passed, 1 skipped, about 70 s; 0 ruff violations before and
+  after. **Declared limit.** (a) The directories created by `mkdtemp` (prefixes `test_feed_data_`,
+  `test_feed_auth_`, and the one of `cm_svc.db`) are not removed, so they accumulate in `/tmp` on
+  persistent machines; under the parallel driver they land in the `TMPDIR` of each part, which the
+  driver removes. (b) The regression test covers only these 6 node ids: a new fixed path elsewhere
+  would not be caught. (c) Not verified: Python 3.12 and a real cloud environment; the times come from
+  a development machine. Checkouts before this fix still write to the old fixed paths.
 - **The orchestrator lost results without saying so when classification, diff, event publishing or
   discovery failed (`COL-29`).** A domain whose classification failed disappeared from the events of
   the cycle; a failed `/diff` (or a history that could not be written) let the snapshot be

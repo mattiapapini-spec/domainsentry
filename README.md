@@ -480,9 +480,11 @@ PYTHONPATH=. pytest tests/ -q
 - **Node.js** is needed by the dashboard rendering tests, which run the page's real script.
   Without `node` on the `PATH` those tests are skipped; with `DOMAINSENTRY_REQUIRE_NODE=1`
   (set in CI) a missing `node` fails the run instead.
-- A few test modules use fixed paths under `/tmp` (`/tmp/cm_svc.db`, `/tmp/test_feed_*`).
-  Delete them before a run when switching between checkouts, and never run two suites at
-  the same time.
+- The tests that write state (the case DB, the feed directories) use fresh temporary
+  directories created under `TMPDIR` at every run, so repeating the suite on the same machine
+  gives the same result. Those directories are not removed by the serial run. Checkouts
+  older than this fix still write to `/tmp/cm_svc.db` and `/tmp/test_feed_*`: delete them
+  before running such a checkout.
 - Stop the parallel driver with Ctrl-C or SIGTERM, never SIGKILL: its workers run in their
   own process groups.
 - Contributions follow the project's rule: a failing regression test first, then the

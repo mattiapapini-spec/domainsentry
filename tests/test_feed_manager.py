@@ -5,7 +5,10 @@ from fastapi.testclient import TestClient
 
 # Override data dir before import
 import os
-os.environ["FEED_DATA"] = "/tmp/test_feed_data"
+import tempfile
+# BUILD-05: directory nuova a ogni esecuzione (rispetta TMPDIR); un path fisso in /tmp sopravvive fra run
+_FEED_DATA = tempfile.mkdtemp(prefix="test_feed_data_")
+os.environ["FEED_DATA"] = _FEED_DATA
 
 from services.feed_manager import app, _safe_client_name
 
@@ -133,7 +136,8 @@ class TestFeedWriteAuth:
         """Reload feed_manager with FEED_REQUIRE_AUTH toggled."""
         import importlib
         monkeypatch.setenv("FEED_REQUIRE_AUTH", "true" if enabled else "false")
-        monkeypatch.setenv("FEED_DATA", "/tmp/test_feed_auth")
+        # BUILD-05: directory nuova, non un path fisso in /tmp che sopravvive fra esecuzioni
+        monkeypatch.setenv("FEED_DATA", tempfile.mkdtemp(prefix="test_feed_auth_"))
         import services.feed_manager as fm
         importlib.reload(fm)
         return fm
@@ -223,7 +227,7 @@ def teardown_module(module):
     """Restore default (no-auth) feed_manager for other test modules."""
     import importlib, os
     os.environ["FEED_REQUIRE_AUTH"] = "false"
-    os.environ["FEED_DATA"] = "/tmp/test_feed_data"
+    os.environ["FEED_DATA"] = _FEED_DATA
     import services.feed_manager as fm
     importlib.reload(fm)
 
@@ -235,7 +239,8 @@ def teardown_module(module):
 class TestClientOnboard:
     def _client(self, monkeypatch, tmp_path):
         import importlib
-        monkeypatch.setenv("FEED_FILE", str(tmp_path / "feed_ob.json"))
+        # BUILD-05: feed_manager legge solo FEED_DATA; FEED_FILE era ignorata e non isolava nulla
+        monkeypatch.setenv("FEED_DATA", str(tmp_path / "feed_ob"))
         monkeypatch.setenv("FEED_REQUIRE_AUTH", "false")
         import services.feed_manager as fm
         importlib.reload(fm)
@@ -289,7 +294,8 @@ class TestPromoteDomain:
     resolving the client's legitimate domain automatically."""
     def _client(self, monkeypatch, tmp_path):
         import importlib
-        monkeypatch.setenv("FEED_FILE", str(tmp_path / "feed_pr.json"))
+        # BUILD-05: feed_manager legge solo FEED_DATA; FEED_FILE era ignorata e non isolava nulla
+        monkeypatch.setenv("FEED_DATA", str(tmp_path / "feed_pr"))
         monkeypatch.setenv("FEED_REQUIRE_AUTH", "false")
         import services.feed_manager as fm
         importlib.reload(fm)
@@ -329,7 +335,8 @@ class TestWhitelistReadOnlyStorage:
     OSError. It must return a clear 503 instead (storage not writable)."""
     def test_readonly_returns_503_not_500(self, monkeypatch, tmp_path):
         import importlib
-        monkeypatch.setenv("FEED_FILE", str(tmp_path / "feed.json"))
+        # BUILD-05: feed_manager legge solo FEED_DATA; FEED_FILE era ignorata e non isolava nulla
+        monkeypatch.setenv("FEED_DATA", str(tmp_path / "feed"))
         monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
         monkeypatch.setenv("FEED_REQUIRE_AUTH", "false")
         import services.feed_manager as fm

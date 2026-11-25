@@ -27,7 +27,7 @@ PYTHONPATH=. pytest tests/ -q                                    # serial, as in
 
 The tests never use the network. Node.js is needed for the dashboard rendering tests (they
 are skipped without it, and fail with `DOMAINSENTRY_REQUIRE_NODE=1`). See
-[README § Tests](README.md#tests) for the fixed `/tmp` paths and how to stop the driver.
+[README § Tests](README.md#tests) for where tests keep their state (fresh temporary directories) and how to stop the driver.
 
 ## Code Style
 
